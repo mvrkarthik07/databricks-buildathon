@@ -163,88 +163,148 @@ fn catalog<'a>(products: &'a Mapped, campaigns: &'a Mapped) -> Catalog<'a> {
     }
 }
 
-fn root(parents: &mut [u32], mut id: u32) -> usize {
+fn root(parents: &mut [u32], mut id: u32) -> u32 {
     while parents[id as usize] != id {
         let parent = parents[id as usize];
         parents[id as usize] = parents[parent as usize];
         id = parent;
     }
-    id as usize
+    id
 }
 
-fn link_names(links: &[Mapped]) -> Links<'_> {
-    let mut users = Ids::default();
-    let mut parents = Vec::new();
-    let mut sizes = Vec::new();
-    for [left, right] in links
-        .iter()
-        .flat_map(|file| lines(file.body()))
-        .filter_map(fields::<2>)
-    {
-        if left.is_empty() || right.is_empty() {
-            continue;
+/// One link row: two IDs of the same person, with their hashes computed while the bytes are hot.
+#[derive(Clone, Copy)]
+struct LinkRow<'a> {
+    a: Text<'a>,
+    b: Text<'a>,
+    hashes: [u64; 4],
+}
+
+fn parse_links<'a>(chunks: Vec<Text<'a>>) -> Vec<LinkRow<'a>> {
+    let mut out = Vec::new();
+    for chunk in chunks {
+        rows::<2>(chunk, |[a, b]| {
+            if a.is_empty() || b.is_empty() {
+                return;
+            }
+            out.push(LinkRow {
+                a,
+                b,
+                hashes: [hash(a), hash2(a), hash(b), hash2(b)],
+            });
+        });
+    }
+    out
+}
+
+/// Builds the ID to person mapping. IDs are identified by their two hashes (see `People`); the
+/// person is the byte-wise smallest ID of the connected component.
+fn build_links<'a>(link_rows: Vec<Vec<LinkRow<'a>>>) -> Links<'a> {
+    let total: usize = link_rows.iter().map(Vec::len).sum();
+    // Every row can introduce two new IDs.
+    let ids = total * 2;
+    let mut table: HashTable<u32> = HashTable::with_capacity(ids);
+    let mut keys: Vec<(u64, u64)> = Vec::with_capacity(ids);
+    let mut names: Vec<Text<'a>> = Vec::with_capacity(ids);
+    let mut parents: Vec<u32> = Vec::with_capacity(ids);
+    let mut sizes: Vec<u32> = Vec::with_capacity(ids);
+    let mut intern = |name: Text<'a>, h: u64, h2: u64| -> u32 {
+        match table.entry(h, |&id| keys[id as usize] == (h, h2), |&id| keys[id as usize].0) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                let id = u32::try_from(keys.len()).expect("too many distinct identifiers");
+                keys.push((h, h2));
+                names.push(name);
+                parents.push(id);
+                sizes.push(1);
+                entry.insert(id);
+                id
+            }
         }
-        let (a, b) = (users.intern(left), users.intern(right));
-        while parents.len() < users.names.len() {
-            parents.push(parents.len() as u32);
-            sizes.push(1usize);
-        }
+    };
+    let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(total);
+    for row in link_rows.iter().flatten() {
+        let a = intern(row.a, row.hashes[0], row.hashes[1]);
+        let b = intern(row.b, row.hashes[2], row.hashes[3]);
+        pairs.push((a, b));
+    }
+    drop(link_rows);
+    for (a, b) in pairs {
         let (mut a, mut b) = (root(&mut parents, a), root(&mut parents, b));
         if a != b {
-            if sizes[a] < sizes[b] {
+            if sizes[a as usize] < sizes[b as usize] {
                 std::mem::swap(&mut a, &mut b);
             }
-            parents[b] = a as u32;
-            sizes[a] += sizes[b];
+            parents[b as usize] = a;
+            sizes[a as usize] += sizes[b as usize];
         }
     }
-    let mut smallest = users.names.clone();
-    for (id, &name) in users.names.iter().enumerate() {
-        let component = root(&mut parents, id as u32);
-        smallest[component] = min(smallest[component], name);
+    let count = names.len();
+    let mut smallest: Vec<u32> = (0..count as u32).collect();
+    for id in 0..count {
+        let component = root(&mut parents, id as u32) as usize;
+        if names[id] < names[smallest[component] as usize] {
+            smallest[component] = id as u32;
+        }
     }
-    let entries: Vec<(Text, Text)> = users
-        .names
-        .into_iter()
-        .enumerate()
-        .map(|(id, name)| (name, smallest[root(&mut parents, id as u32)]))
-        .collect();
-    Links::new(entries)
+    let mut links = Links::with_capacity(count);
+    for id in 0..count {
+        let target = smallest[root(&mut parents, id as u32) as usize] as usize;
+        if target != id {
+            links.insert(
+                keys[id],
+                LinkTarget {
+                    name: names[target],
+                    hash: keys[target].0,
+                    hash2: keys[target].1,
+                },
+            );
+        }
+    }
+    links
 }
 
-/// Maps a linked ID to the person's smallest ID. A one-hash bloom filter answers the common
-/// "not linked" case without touching the table.
+#[derive(Clone, Copy)]
+struct LinkTarget<'a> {
+    name: Text<'a>,
+    hash: u64,
+    hash2: u64,
+}
+
+/// Maps a linked ID to the person's smallest ID, found by the ID's two hashes. IDs that are
+/// their own person are absent. A one-hash bloom filter answers the common "not linked" case
+/// without touching the table.
 struct Links<'a> {
-    table: HashTable<(Text<'a>, Text<'a>)>,
+    table: HashTable<((u64, u64), LinkTarget<'a>)>,
     bloom: Vec<u64>,
     shift: u32,
 }
 
 impl<'a> Links<'a> {
-    fn new(entries: Vec<(Text<'a>, Text<'a>)>) -> Self {
-        let bits = (entries.len().max(1) * 32).next_power_of_two().max(64);
-        let shift = 64 - bits.trailing_zeros();
-        let mut links = Links {
-            table: HashTable::with_capacity(entries.len()),
+    fn with_capacity(count: usize) -> Self {
+        let bits = (count.max(1) * 32).next_power_of_two().max(64);
+        Links {
+            table: HashTable::with_capacity(count),
             bloom: vec![0; bits / 64],
-            shift,
-        };
-        for entry in entries {
-            let h = hash(entry.0);
-            let bit = (h >> shift) as usize;
-            links.bloom[bit / 64] |= 1 << (bit % 64);
-            links.table.insert_unique(h, entry, |e| hash(e.0));
+            shift: 64 - bits.trailing_zeros(),
         }
-        links
+    }
+
+    fn insert(&mut self, key: (u64, u64), target: LinkTarget<'a>) {
+        let bit = (key.0 >> self.shift) as usize;
+        self.bloom[bit / 64] |= 1 << (bit % 64);
+        self.table.insert_unique(key.0, (key, target), |e| e.0.0);
     }
 
     #[inline]
-    fn resolve(&self, user: Text<'a>, h: u64) -> Option<Text<'a>> {
-        let bit = (h >> self.shift) as usize;
+    fn resolve(&self, hash: u64, hash2: u64) -> Option<LinkTarget<'a>> {
+        let bit = (hash >> self.shift) as usize;
         if self.bloom[bit / 64] >> (bit % 64) & 1 == 0 {
             return None;
         }
-        self.table.find(h, |e| e.0 == user).map(|e| e.1)
+        self.table
+            .find(hash, |e| e.0 == (hash, hash2))
+            .map(|e| e.1)
     }
 }
 
@@ -441,8 +501,8 @@ fn dedup_events<'a>(
     let mut routed: Vec<Vec<NamedEvent>> = (0..workers).map(|_| Vec::with_capacity(share)).collect();
     for (batch, winner) in batches.iter().zip(&winner) {
         for (row, _) in batch.iter().zip(winner).filter(|&(row, &win)| win && row.valid) {
-            let (name, hash, hash2) = match people.resolve(row.user, row.user_hash) {
-                Some(name) => (name, crate::hash(name), self::hash2(name)),
+            let (name, hash, hash2) = match people.resolve(row.user_hash, row.user_hash2) {
+                Some(target) => (target.name, target.hash, target.hash2),
                 None => (row.user, row.user_hash, row.user_hash2),
             };
             routed[worker_of(hash, workers)].push(NamedEvent {
@@ -485,10 +545,10 @@ fn route_clicks<'a>(
         if ts < start - WEEK || ts >= end {
             return;
         }
-        let user_hash = crate::hash(user);
-        let (hash, hash2) = match people.resolve(user, user_hash) {
-            Some(name) => (crate::hash(name), self::hash2(name)),
-            None => (user_hash, self::hash2(user)),
+        let (user_hash, user_hash2) = (crate::hash(user), self::hash2(user));
+        let (hash, hash2) = match people.resolve(user_hash, user_hash2) {
+            Some(target) => (target.hash, target.hash2),
+            None => (user_hash, user_hash2),
         };
         routed[worker_of(hash, workers)].push(NamedClick {
             hash,
@@ -712,8 +772,17 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
     let links = csv_files(&data.join("links"))?;
     let event_files = csv_files(&data.join("events"))?;
     let click_files = csv_files(&data.join("clicks"))?;
+    let link_rows = parallel(chunk_batches(&links, workers), workers, parse_links);
+    lap("link parse");
     let (people, copies) = thread::scope(|scope| {
-        let people = scope.spawn(|| link_names(&links));
+        let people = scope.spawn(|| {
+            let t = std::time::Instant::now();
+            let people = build_links(link_rows);
+            if timing {
+                eprintln!("  build_links: {:?}", t.elapsed());
+            }
+            people
+        });
         let copies = parallel(chunk_batches(&event_files, workers), workers, |chunks| {
             route_rows(chunks, &catalog, start, end)
         });
