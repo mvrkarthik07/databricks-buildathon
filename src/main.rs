@@ -11,7 +11,7 @@ use std::thread;
 
 use hashbrown::HashTable;
 use hashbrown::hash_table::Entry;
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHasher};
+use rustc_hash::{FxHashMap, FxHasher};
 
 use input::{
     DAY, Dates, GAP, Mapped, WEEK, chunk_batches, csv_files, decimal, fields, lines, rows, timestamp,
@@ -21,7 +21,7 @@ use output::{CampaignRow, UserRow};
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 type Text<'a> = &'a [u8];
-const DEDUP_SHARDS: usize = 32;
+const DEDUP_SHARDS: usize = 64;
 
 /// A second hash, independent of `hash`, built from folded 128-bit multiplies.
 fn hash2(text: &[u8]) -> u64 {
@@ -410,8 +410,9 @@ fn route_rows<'a>(
             return;
         }
         let hash = hash(id);
-        // Keep shard bits separate from hashbrown's low bucket bits and top seven tag bits.
-        let shard = ((hash >> 52) as usize) % DEDUP_SHARDS;
+        // Keep shard bits separate from hashbrown's low bucket bits (below 2^32 buckets) and its
+        // top seven tag bits.
+        let shard = ((hash >> 40) as usize) % DEDUP_SHARDS;
         let parsed = (|| {
             if user.is_empty() || product.is_empty() {
                 return None;
@@ -586,6 +587,117 @@ struct CampaignTotals {
 
 type CampaignDaily = FxHashMap<(u32, i32), CampaignTotals>;
 
+/// Largest dense (campaign x day) table, in cells. A longer window or more campaigns than this
+/// falls back to hashing, so any manifest and any `campaigns.csv` still work.
+const DENSE_CELLS: usize = 1 << 18;
+
+/// Per-(campaign, day) totals, indexed directly while the table is small (the normal case: a
+/// couple of weeks of days and a few thousand campaigns).
+enum DailyTotals {
+    Dense { first_day: i32, campaigns: usize, cells: Vec<CampaignTotals> },
+    Sparse(CampaignDaily),
+}
+
+impl DailyTotals {
+    /// Session days lie in `first_day..=last_day`: every event is inside the manifest window.
+    fn new(first_day: i32, last_day: i32, campaigns: usize) -> Self {
+        let days = (i64::from(last_day) - i64::from(first_day) + 1) as usize;
+        match days.checked_mul(campaigns) {
+            Some(cells) if cells <= DENSE_CELLS => {
+                Self::Dense { first_day, campaigns, cells: vec![CampaignTotals::default(); cells] }
+            }
+            _ => Self::Sparse(CampaignDaily::default()),
+        }
+    }
+
+    #[inline]
+    fn at(&mut self, campaign: u32, day: i32) -> &mut CampaignTotals {
+        match self {
+            Self::Dense { first_day, campaigns, cells } => {
+                &mut cells[(day - *first_day) as usize * *campaigns + campaign as usize]
+            }
+            Self::Sparse(map) => map.entry((campaign, day)).or_default(),
+        }
+    }
+
+    /// Adds another worker's totals. Every worker builds the same kind of table.
+    fn add(&mut self, other: Self) {
+        fn sum(total: &mut CampaignTotals, part: CampaignTotals) {
+            total.sessions += part.sessions;
+            total.purchasing += part.purchasing;
+            total.revenue += part.revenue;
+            total.assists += part.assists;
+        }
+        match (self, other) {
+            (Self::Dense { cells, .. }, Self::Dense { cells: part, .. }) => {
+                cells.iter_mut().zip(part).for_each(|(total, part)| sum(total, part));
+            }
+            (Self::Sparse(map), Self::Sparse(part)) => {
+                for (key, part) in part {
+                    sum(map.entry(key).or_default(), part);
+                }
+            }
+            _ => unreachable!("workers build the same kind of table"),
+        }
+    }
+
+    /// Every (campaign, day) that received a session or an assist.
+    fn entries(self) -> Vec<((u32, i32), CampaignTotals)> {
+        match self {
+            Self::Dense { first_day, campaigns, cells } => cells
+                .into_iter()
+                .enumerate()
+                .filter(|(_, part)| part.sessions != 0 || part.assists != 0)
+                .map(|(i, part)| (((i % campaigns) as u32, first_day + (i / campaigns) as i32), part))
+                .collect(),
+            Self::Sparse(map) => map.into_iter().collect(),
+        }
+    }
+}
+
+/// The campaigns with a click in the current 7-day look-back, with how many clicks each has.
+/// Direct-indexed by campaign; `list` holds the live campaigns so a session visits only those.
+struct Active {
+    count: Vec<u32>,
+    slot: Vec<u32>,
+    list: Vec<u32>,
+}
+
+impl Active {
+    fn new(campaigns: usize) -> Self {
+        Self { count: vec![0; campaigns], slot: vec![0; campaigns], list: Vec::new() }
+    }
+
+    #[inline]
+    fn add(&mut self, campaign: u32) {
+        let c = campaign as usize;
+        if self.count[c] == 0 {
+            self.slot[c] = self.list.len() as u32;
+            self.list.push(campaign);
+        }
+        self.count[c] += 1;
+    }
+
+    #[inline]
+    fn remove(&mut self, campaign: u32) {
+        let c = campaign as usize;
+        self.count[c] -= 1;
+        if self.count[c] == 0 {
+            let slot = self.slot[c] as usize;
+            let moved = self.list[self.list.len() - 1];
+            self.list.swap_remove(slot);
+            self.slot[moved as usize] = slot as u32;
+        }
+    }
+
+    fn clear(&mut self) {
+        for &campaign in &self.list {
+            self.count[campaign as usize] = 0;
+        }
+        self.list.clear();
+    }
+}
+
 /// Groups `items` by person with a counting sort. Returns the grouped items and, for each
 /// person, the start of their range (one extra entry marks the end).
 fn group_by_person<T: Copy + Default>(
@@ -614,7 +726,8 @@ fn aggregate<'a>(
     event_batches: Vec<Vec<NamedEvent<'a>>>,
     click_batches: Vec<Vec<NamedClick<'a>>>,
     catalog: &Catalog<'a>,
-) -> (Vec<UserRow<'a>>, CampaignDaily) {
+    (first_day, last_day): (i32, i32),
+) -> (Vec<UserRow<'a>>, DailyTotals) {
     let mut people = People::default();
     let event_count: usize = event_batches.iter().map(Vec::len).sum();
     let mut event_person = Vec::with_capacity(event_count);
@@ -648,10 +761,11 @@ fn aggregate<'a>(
     drop((event_batches, click_batches, event_person, click_person));
 
     let mut users = Vec::new();
-    let mut campaigns = CampaignDaily::default();
+    let campaign_count = catalog.campaigns.names.len();
+    let mut campaigns = DailyTotals::new(first_day, last_day, campaign_count);
     let mut spend = vec![0i64; catalog.categories.names.len()];
     let mut touched = Vec::new();
-    let mut active: FxHashMap<u32, usize> = FxHashMap::with_hasher(FxBuildHasher);
+    let mut active = Active::new(campaign_count);
 
     for person in 0..person_count {
         let name = people.names[person];
@@ -703,26 +817,22 @@ fn aggregate<'a>(
                 first + person_clicks[first..].partition_point(|click| click.ts < start - WEEK);
             let next_last = last + person_clicks[last..].partition_point(|click| click.ts <= start);
             for click in &person_clicks[first..min(last, next_first)] {
-                let count = active.get_mut(&click.campaign).unwrap();
-                *count -= 1;
-                if *count == 0 {
-                    active.remove(&click.campaign);
-                }
+                active.remove(click.campaign);
             }
             for click in &person_clicks[last.max(next_first)..next_last] {
-                *active.entry(click.campaign).or_default() += 1;
+                active.add(click.campaign);
             }
             first = next_first;
             last = next_last;
-            for &campaign in active.keys() {
-                campaigns.entry((campaign, day)).or_default().assists += 1;
+            for &campaign in &active.list {
+                campaigns.at(campaign, day).assists += 1;
             }
             let winner = if first == last {
                 catalog.organic
             } else {
                 person_clicks[last - 1].campaign
             };
-            let total = campaigns.entry((winner, day)).or_default();
+            let total = campaigns.at(winner, day);
             total.sessions += 1;
             total.purchasing += i64::from(revenue != 0);
             total.revenue += revenue;
@@ -779,11 +889,20 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
 
     let products = Mapped::open(&data.join("products.csv"))?;
     let campaigns = Mapped::open(&data.join("campaigns.csv"))?;
-    let catalog = catalog(&products, &campaigns);
-    lap("catalog");
-    let links = csv_files(&data.join("links"))?;
-    let event_files = csv_files(&data.join("events"))?;
-    let click_files = csv_files(&data.join("clicks"))?;
+    // The catalog is only needed once events are parsed, so build it while the inputs are mapped.
+    let (catalog, files) = thread::scope(|scope| {
+        let catalog = scope.spawn(|| catalog(&products, &campaigns));
+        let files = (|| -> Result<_> {
+            Ok((
+                csv_files(&data.join("links"), workers)?,
+                csv_files(&data.join("events"), workers)?,
+                csv_files(&data.join("clicks"), workers)?,
+            ))
+        })();
+        (catalog.join().unwrap(), files)
+    });
+    let (links, event_files, click_files) = files?;
+    lap("catalog + files");
     let link_rows = parallel(chunk_batches(&links, workers), workers, parse_links);
     lap("link parse");
     let (people, copies) = thread::scope(|scope| {
@@ -819,11 +938,13 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
         .zip(transpose(clicks, workers))
         .enumerate()
         .collect();
+    // Event timestamps are inside the window, so session days are too.
+    let days = (start.div_euclid(DAY) as i32, (end - 1).div_euclid(DAY) as i32);
     let results = parallel(
         jobs,
         workers,
-        |(shard, (events, clicks))| -> Result<CampaignDaily> {
-            let (users, campaigns) = aggregate(events, clicks, &catalog);
+        |(shard, (events, clicks))| -> Result<DailyTotals> {
+            let (users, campaigns) = aggregate(events, clicks, &catalog, days);
             if shard == 0 || !users.is_empty() {
                 output::users(&user_folder.join(format!("part-{shard}.parquet")), &users)?;
             }
@@ -832,17 +953,17 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
     );
 
     lap("aggregate+users");
-    let mut merged = CampaignDaily::default();
+    let mut merged: Option<DailyTotals> = None;
     for result in results {
-        for (key, part) in result? {
-            let total = merged.entry(key).or_default();
-            total.sessions += part.sessions;
-            total.purchasing += part.purchasing;
-            total.revenue += part.revenue;
-            total.assists += part.assists;
+        let totals = result?;
+        match &mut merged {
+            Some(merged) => merged.add(totals),
+            None => merged = Some(totals),
         }
     }
     let rows: Vec<_> = merged
+        .map(DailyTotals::entries)
+        .unwrap_or_default()
         .into_iter()
         .map(|((campaign, day), totals)| CampaignRow {
             day,
@@ -851,7 +972,25 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
             totals,
         })
         .collect();
-    output::campaigns(&campaign_folder.join("part-0.parquet"), &rows)?;
+    // Any number of part files is valid; `part-0` always exists, even when there are no rows.
+    let share = rows.len().div_ceil(workers).max(1);
+    thread::scope(|scope| -> Result<()> {
+        let parts: Vec<_> = rows
+            .chunks(share)
+            .enumerate()
+            .map(|(i, part)| {
+                let path = campaign_folder.join(format!("part-{i}.parquet"));
+                scope.spawn(move || output::campaigns(&path, part))
+            })
+            .collect();
+        if parts.is_empty() {
+            output::campaigns(&campaign_folder.join("part-0.parquet"), &rows)?;
+        }
+        for part in parts {
+            part.join().unwrap()?;
+        }
+        Ok(())
+    })?;
     lap("campaigns");
     Ok(())
 }
@@ -873,4 +1012,70 @@ fn main() -> Result<()> {
     run(&data, &output, workers)?;
     // Everything is written and closed; skip tearing down gigabytes of buffers.
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tiny deterministic generator, so the test needs no dependency.
+    fn next(state: &mut u64) -> u64 {
+        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *state >> 33
+    }
+
+    #[test]
+    fn active_matches_a_counting_map() {
+        let mut state = 7;
+        let (mut active, mut model) = (Active::new(8), FxHashMap::<u32, u32>::default());
+        for _ in 0..10_000 {
+            let campaign = (next(&mut state) % 8) as u32;
+            if next(&mut state) % 2 == 0 || !model.contains_key(&campaign) {
+                active.add(campaign);
+                *model.entry(campaign).or_default() += 1;
+            } else {
+                active.remove(campaign);
+                let count = model.get_mut(&campaign).unwrap();
+                *count -= 1;
+                if *count == 0 {
+                    model.remove(&campaign);
+                }
+            }
+            let mut live = active.list.clone();
+            live.sort_unstable();
+            let mut expected: Vec<_> = model.keys().copied().collect();
+            expected.sort_unstable();
+            assert_eq!(live, expected);
+        }
+        active.clear();
+        assert!(active.list.is_empty() && active.count.iter().all(|&n| n == 0));
+    }
+
+    #[test]
+    fn dense_and_sparse_totals_agree() {
+        // 10 days x 3 campaigns is dense; 10 days x 100_000 campaigns exceeds DENSE_CELLS.
+        let (mut dense, mut sparse) = (DailyTotals::new(100, 109, 3), DailyTotals::new(100, 109, 100_000));
+        assert!(matches!(dense, DailyTotals::Dense { .. }));
+        assert!(matches!(sparse, DailyTotals::Sparse(_)));
+        let mut state = 11;
+        for _ in 0..1_000 {
+            let (campaign, day) = ((next(&mut state) % 3) as u32, 100 + (next(&mut state) % 10) as i32);
+            for totals in [&mut dense, &mut sparse] {
+                let total = totals.at(campaign, day);
+                total.sessions += 1;
+                total.assists += 2;
+            }
+        }
+        let mut other = DailyTotals::new(100, 109, 3);
+        other.at(2, 105).sessions += 5;
+        dense.add(other);
+        sparse.at(2, 105).sessions += 5;
+        let sorted = |totals: DailyTotals| {
+            let mut entries: Vec<_> =
+                totals.entries().into_iter().map(|(k, t)| (k, t.sessions, t.assists)).collect();
+            entries.sort_unstable();
+            entries
+        };
+        assert_eq!(sorted(dense), sorted(sparse));
+    }
 }

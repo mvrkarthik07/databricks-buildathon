@@ -69,7 +69,9 @@ impl Drop for Mapped {
     }
 }
 
-pub fn csv_files(folder: &Path) -> io::Result<Vec<Mapped>> {
+/// Maps every `*.csv` in `folder`, sorted by path. Opening and mapping a file costs tens of
+/// microseconds and a dataset has hundreds, so large folders are mapped by several threads.
+pub fn csv_files(folder: &Path, workers: usize) -> io::Result<Vec<Mapped>> {
     let mut paths = Vec::new();
     match folder.read_dir() {
         Ok(entries) => {
@@ -88,7 +90,21 @@ pub fn csv_files(folder: &Path) -> io::Result<Vec<Mapped>> {
         Err(e) => return Err(e),
     }
     paths.sort_unstable();
-    paths.iter().map(|path| Mapped::open(path)).collect()
+    if workers < 2 || paths.len() < 16 {
+        return paths.iter().map(|path| Mapped::open(path)).collect();
+    }
+    let share = paths.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        let parts: Vec<_> = paths
+            .chunks(share)
+            .map(|part| scope.spawn(move || part.iter().map(|path| Mapped::open(path)).collect::<io::Result<Vec<_>>>()))
+            .collect();
+        let mut files = Vec::with_capacity(paths.len());
+        for part in parts {
+            files.extend(part.join().unwrap()?);
+        }
+        Ok(files)
+    })
 }
 
 pub fn chunk_batches(files: &[Mapped], workers: usize) -> Vec<Vec<&[u8]>> {
