@@ -215,3 +215,72 @@ python3 tools/ab.py /tmp/d20m 41 ./shopping-sessions-6c87438 target/release/shop
 for s in 101 202 303; do generator/target/release/generate --seed $s --events 10000000 --clicks 2500000 --output /tmp/d10_$s; done
 /usr/bin/time -l target/release/shopping-sessions /tmp/d20m /tmp/out   # peak RSS
 ```
+
+## Phase 5: x86 measurements and the 1.99 s scored build
+
+Scored commit `0141e3d` (official 1.99 s). Experiment branch: `exp/compact-ids`; `main` and the
+branch `scored-1.99s` still point at the scored build. x86 numbers come from GitHub-hosted runners
+(`.github/workflows/x86-bench.yml`, manual dispatch): 4 vCPU, 16 GB, and whichever CPU the pool
+hands out (AMD EPYC 9V45, EPYC 7763 and Intel Xeon 6973P-C in these runs). They are not the
+scorer's 8-vCPU Cascade Lake. Use them to compare builds and stages, never as a score.
+Dataset: seed 20261003, 20M events, 5M clicks. The 36 published fixtures are in a git-ignored
+folder, so CI runs the 7 adversarial fixtures and the Python oracle on seeds 11, 22, 33 instead;
+the 36 run locally.
+
+### Scored build, per stage (EPYC 9V45, 4 vCPU, 3.27 s total, peak RSS 3.8 GB)
+
+| Stage | Wall | Share |
+| --- | ---: | ---: |
+| catalog, mapping, link parse | 30 ms | 1% |
+| parse + route events | 1064 ms | 32% |
+| dedup (insert, winners, resolve + route) | 904 ms | 28% |
+| click routing | 300 ms | 9% |
+| aggregate + user parquet | 896 ms | 27% |
+| merge + campaign parquet + exit | 80 ms | 2% |
+
+Sampled profile, 4 threads, 22k samples (share of all CPU): dedup 19.1%, aggregate 16.1%, AVX2
+row splitter 12.0%, `route_rows` field parse 7.5%, `memchr` 4.5% (the line-count pre-pass),
+`Links::resolve` 4.5%, timestamp parse 3.9%, kernel page faults and zeroing about 6%, event
+quicksort 2.0%. Single-thread microbenchmark (`SS_BENCH=1`), ns per event row: AVX2 split 37
+(scalar `memchr2` split 84), +event-id hash 4, +user hashes 1, +both timestamps 23, full
+`route_rows` 113 to 118 whatever the shard count from 1 to 512 (4096: 140).
+
+### Results
+
+| Experiment | x86 result | Output | Decision |
+| --- | --- | --- | --- |
+| Phases 3 and 4 against the original `6c87438` | 3709 -> 3284 ms (-10.8%) | matches | already in the scored build |
+| Shard count sweep 32/64/128/256/512/1024/2048 | 2943, 2919, 2904, 2869, **2771**, 2817, 2831 ms | all 7 match | tables of about 40k rows fit a 2 MiB L2 |
+| Adaptive shards (`SHARD_ROWS` = 40 000, so 512 at 20M) vs fixed 64 | -119.7 ms (-3.8%, Xeon 6973P-C), -177.6 ms (-5.2%, EPYC 7763) | match | kept |
+| Adaptive shards build vs scored build, Intel Xeon 6973P-C | 3215.8 -> 3026.9 ms (-5.9%), CPU 11903 -> 11185 ms | match | |
+| Sampled row-count estimate in place of the line-count pre-pass | -29 ms in one run, +29 ms by medians, CPU unchanged | match | reverted: the cold-memory cost moves to the splitter |
+
+On the M5 the shard count showed nothing (Phase 4); its L2 is far larger, which is why it only
+appeared on x86.
+
+### What was not built, and why
+
+- **Compact-ID decoding and direct-index dedup.** The generator writes `base36(scramble(index, key))`
+  with a per-dataset key. A decoded ID is already a uniform 40-bit number, so decoding replaces
+  hashing at about the same cost. Measured hashing is 4 to 5 of about 113 ns per row, and the
+  dedup insert is a cache-miss cost, which the L2-sized shards already cut. Recovering the dense
+  index needs the generator's fixed multipliers and a search over about 2^25 key candidates, and
+  correctness needs a fallback for noncanonical IDs (leading zeros, uppercase, over 40 bits). The
+  most it can save is the dedup insert, about 9% of CPU (987 thread-ms of about 11 s). Not
+  implemented; it would also tie the fast path to this generator.
+- **Why 7.65x is out of reach for any single change.** The target is 0.26 s on 8 vCPUs, about 2.1
+  thread-seconds for 20M rows, or about 100 ns per row for all stages together. The measured total
+  here is about 11 to 12 thread-seconds, 550 to 600 ns per row, and `route_rows` alone is 113 ns.
+  The largest stage is 19% of CPU. Removing dedup entirely would give 1.24x. Reaching the target
+  needs every stage at least five times cheaper: AVX-512 splitting and timestamp parsing,
+  records written once instead of three times, and a person-keyed layout that skips the second
+  redistribution. That is a rewrite, not an experiment, and nothing here shows it would get to 0.26 s.
+
+### Reproduce
+
+```sh
+gh workflow run x86-bench.yml --ref exp/compact-ids -f base=0141e3d -f events=20000000
+gh workflow run x86-bench.yml --ref exp/compact-ids -f only_micro=true   # microbenchmark + perf profile
+SS_SHARDS=512 SS_TIMING=1 target/release/shopping-sessions DATA OUT        # knob and stage timers
+SS_BENCH=1 target/release/shopping-sessions DATA OUT                       # parse microbenchmark
+```
