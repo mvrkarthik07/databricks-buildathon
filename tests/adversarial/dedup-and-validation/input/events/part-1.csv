@@ -1,0 +1,10 @@
+event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents
+"keep-first",first,2028-02-29T10:00:00Z,2028-02-29T10:00:00Z,purchase,p1,8
+original-bad-ts,first,bad-ts,2028-02-29T10:00:00Z,view,p1,
+original-bad-user,"",2028-02-29T10:00:00Z,2028-02-29T10:00:00Z,view,p1,
+original-bad-type,first,2028-02-29T10:00:00Z,2028-02-29T10:00:00Z,Purchase,p1,
+original-bad-product,first,2028-02-29T10:00:00Z,2028-02-29T10:00:00Z,view,"",
+original-bad-price,first,2028-02-29T10:00:00Z,2028-02-29T10:00:00Z,purchase,p1,bad
+original-late,first,2028-02-28T00:00:00Z,2028-02-29T00:00:01Z,view,p1,
+original-outside,first,2028-02-27T23:59:59Z,2028-02-28T00:00:00Z,view,p1,
+"equal","first","2028-02-29T10:00:00Z","2028-02-29T12:00:00Z","view","p1",""

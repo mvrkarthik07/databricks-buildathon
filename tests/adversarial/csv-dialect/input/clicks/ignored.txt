@@ -1,0 +1,2 @@
+click_id,user_id,campaign_id,ts
+ignored,u,c_3,2028-02-29T10:00:00Z

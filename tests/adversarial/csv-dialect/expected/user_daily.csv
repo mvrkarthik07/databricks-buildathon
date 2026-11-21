@@ -1,0 +1,5 @@
+user_id,day,sessions,events,revenue_cents,top_category
+ u,2028-02-29,1,2,250,électro
+u ,2028-02-29,1,1,0,
+"u",2028-02-29,1,1,5,books
+u,2028-02-29,1,4,3,unknown

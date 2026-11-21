@@ -1,0 +1,12 @@
+__pycache__/
+.venv/
+.DS_Store
+/target/
+/generator/target/
+/dev/
+/dev-answer/
+/out/
+/starter-duckdb/
+/starter-duckdb.zip
+/generator.zip
+/dev-answer.zip

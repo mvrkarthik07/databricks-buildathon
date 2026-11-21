@@ -1,0 +1,2 @@
+event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents
+ignored,ghost,2028-02-29T10:00:00Z,2028-02-29T12:00:00Z,view,p1,

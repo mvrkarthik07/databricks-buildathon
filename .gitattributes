@@ -1,0 +1,2 @@
+# A carriage return is part of the fixture data.
+tests/adversarial/**/input/**/*.csv -text

@@ -1,0 +1,5 @@
+event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents
+leap,leap-2000,2000-02-29T00:00:00Z,2000-02-29T00:00:00Z,view,p1,
+no-leap,invalid-1900,1900-02-29T00:00:00Z,1900-03-01T00:00:00Z,view,p1,
+no-leap-2100,invalid-2100,2100-02-29T00:00:00Z,2100-03-01T00:00:00Z,view,p1,
+feb-last,valid-2100,2100-02-28T23:59:00Z,2100-03-01T00:00:00Z,view,p1,

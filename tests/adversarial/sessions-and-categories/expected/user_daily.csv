@@ -1,0 +1,4 @@
+user_id,day,sessions,events,revenue_cents,top_category
+gap,2028-02-29,1,4,200,books
+gap,2028-03-01,3,4,151,video
+z,2028-02-29,1,2,60,unknown

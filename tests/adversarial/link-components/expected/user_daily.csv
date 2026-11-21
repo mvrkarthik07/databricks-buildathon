@@ -1,0 +1,6 @@
+user_id,day,sessions,events,revenue_cents,top_category
+A-unused,2028-02-29,2,4,45,books
+not-shared,2028-02-29,1,1,0,
+a-unused,2028-02-29,1,1,0,
+Shared,2028-02-29,1,1,0,
+ shared,2028-02-29,1,1,0,

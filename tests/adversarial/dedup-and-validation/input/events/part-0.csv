@@ -1,0 +1,28 @@
+event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents
+keep-first,later,2028-02-29T10:00:00Z,2028-02-29T12:00:00Z,purchase,p1,999
+original-bad-ts,later,2028-02-29T10:00:00Z,2028-02-29T12:00:00Z,view,p1,
+original-bad-user,later,2028-02-29T10:00:00Z,2028-02-29T12:00:00Z,view,p1,
+original-bad-type,later,2028-02-29T10:00:00Z,2028-02-29T12:00:00Z,view,p1,
+original-bad-product,later,2028-02-29T10:00:00Z,2028-02-29T12:00:00Z,view,p1,
+original-bad-price,later,2028-02-29T10:00:00Z,2028-02-29T12:00:00Z,purchase,p1,42
+original-late,later,2028-03-01T09:00:00Z,2028-03-01T12:00:00Z,view,p1,
+original-outside,later,2028-02-29T10:00:00Z,2028-02-29T12:00:00Z,view,p1,
+equal,first,2028-02-29T10:00:00Z,2028-02-29T12:00:00Z,view,p1,
+late-no,first,1835431199999,2028-03-01T10:00:00Z,view,p1,
+late-yes,first,2028-02-29T10:00:00Z,2028-03-01T10:00:00Z,view,p1,
+time-travel,first,2028-02-29T10:00:00Z,2028-02-28T00:00:00Z,purchase,p1,0000000000000000000001
+max-price,first,2028-02-29T10:00:00Z,2028-02-29T12:00:00Z,purchase,p2,10000000
+case-product,first,2028-02-29T10:00:00Z,2028-02-29T12:00:00Z,purchase,P1,7
+ignore-cart-price,first,2028-02-29T10:00:00Z,2028-02-29T12:00:00Z,cart,p1,not price
+bad-price-0,first,2028-02-29T10:00:00Z,2028-02-29T12:00:00Z,purchase,p1,0
+bad-price-1,first,2028-02-29T10:00:00Z,2028-02-29T12:00:00Z,purchase,p1,000
+bad-price-2,first,2028-02-29T10:00:00Z,2028-02-29T12:00:00Z,purchase,p1,
+bad-price-3,first,2028-02-29T10:00:00Z,2028-02-29T12:00:00Z,purchase,p1,""
+bad-price-4,first,2028-02-29T10:00:00Z,2028-02-29T12:00:00Z,purchase,p1,-1
+bad-price-5,first,2028-02-29T10:00:00Z,2028-02-29T12:00:00Z,purchase,p1,+1
+bad-price-6,first,2028-02-29T10:00:00Z,2028-02-29T12:00:00Z,purchase,p1,1.0
+bad-price-7,first,2028-02-29T10:00:00Z,2028-02-29T12:00:00Z,purchase,p1,1e2
+bad-price-8,first,2028-02-29T10:00:00Z,2028-02-29T12:00:00Z,purchase,p1,10000001
+bad-price-9,first,2028-02-29T10:00:00Z,2028-02-29T12:00:00Z,purchase,p1,9999999999999999999999999999
+bad-price-10,first,2028-02-29T10:00:00Z,2028-02-29T12:00:00Z,purchase,p1, 1
+bad-price-11,first,2028-02-29T10:00:00Z,2028-02-29T12:00:00Z,purchase,p1,1 
