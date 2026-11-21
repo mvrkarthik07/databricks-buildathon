@@ -1,0 +1,26 @@
+# Manual, quick: parse microbenchmark at several dedup shard counts, on the runner's x86 CPU.
+name: x86-micro
+on:
+  workflow_dispatch:
+    inputs:
+      events:
+        default: "20000000"
+jobs:
+  micro:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: CPU
+        run: |
+          lscpu | grep -E "Model name|^CPU\(s\)|L2|L3"
+          echo "flags: $(grep -m1 flags /proc/cpuinfo | tr ' ' '\n' | grep -E '^(avx2|avx512[a-z_0-9]*|bmi2)$' | sort -u | tr '\n' ' ')"
+      - uses: dtolnay/rust-toolchain@stable
+      - run: |
+          cargo build --release --locked
+          (cd generator && cargo build --release)
+          generator/target/release/generate --seed 20261003 --events "${{ inputs.events }}" --clicks $(( ${{ inputs.events }} / 4 )) --output /tmp/data
+      - name: route_rows ns/row by shard count (single thread)
+        run: |
+          for n in 1 8 64 512 4096; do
+            echo "== SS_SHARDS=$n"; SS_SHARDS=$n SS_BENCH=1 target/release/shopping-sessions /tmp/data /tmp/o 2>&1 | grep -E "full route_rows|split \(rows:"
+          done
