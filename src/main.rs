@@ -1068,25 +1068,7 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
             totals,
         })
         .collect();
-    // Any number of part files is valid; `part-0` always exists, even when there are no rows.
-    let share = rows.len().div_ceil(workers).max(1);
-    thread::scope(|scope| -> Result<()> {
-        let parts: Vec<_> = rows
-            .chunks(share)
-            .enumerate()
-            .map(|(i, part)| {
-                let path = campaign_folder.join(format!("part-{i}.parquet"));
-                scope.spawn(move || output::campaigns(&path, part))
-            })
-            .collect();
-        if parts.is_empty() {
-            output::campaigns(&campaign_folder.join("part-0.parquet"), &rows)?;
-        }
-        for part in parts {
-            part.join().unwrap()?;
-        }
-        Ok(())
-    })?;
+    output::campaigns(&campaign_folder.join("part-0.parquet"), &rows)?;
     lap("campaigns");
     Ok(())
 }

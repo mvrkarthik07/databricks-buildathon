@@ -1,0 +1,50 @@
+# Manual only. Reports the runner's CPU flags first, so an AVX2 or AVX-512 result is never assumed,
+# then checks correctness and A/B-times the current commit against BASE on x86-64.
+name: x86-bench
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "Commit to compare against (the pre-optimization build)"
+        default: "6c87438"
+      events:
+        description: "Events in the generated dataset"
+        default: "5000000"
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: CPU and memory
+        run: |
+          lscpu | grep -E "Model name|^CPU\(s\)|Thread|L2|L3"
+          echo "flags: $(grep -m1 flags /proc/cpuinfo | tr ' ' '\n' | grep -E '^(avx2|avx512[a-z_0-9]*|bmi2|popcnt)$' | sort -u | tr '\n' ' ')"
+          free -m | head -2
+      - uses: dtolnay/rust-toolchain@stable
+      - run: pip install pyarrow
+      - name: Build current and base
+        run: |
+          cargo build --release --locked
+          cp target/release/shopping-sessions /tmp/new
+          git worktree add /tmp/basetree "${{ inputs.base }}"
+          (cd /tmp/basetree && cargo build --release --locked && cp target/release/shopping-sessions /tmp/base)
+          (cd generator && cargo build --release)
+      - name: Unit tests and published fixtures
+        run: |
+          cargo test --release --locked
+          make check-fixtures check-adversarial PYTHON=python3 REF=/tmp/new
+      - name: Dataset
+        run: |
+          generator/target/release/generate --seed 20261003 --events "${{ inputs.events }}" \
+            --clicks $(( ${{ inputs.events }} / 4 )) --output /tmp/data
+      - name: Output matches the base build
+        run: |
+          /tmp/base /tmp/data /tmp/out-base
+          /tmp/new /tmp/data /tmp/out-new
+          python3 tools/diff.py /tmp/out-new /tmp/out-base | tail -3
+      - name: Interleaved timing (runner has few cores; NCPU is clamped to 1..8)
+        run: |
+          NCPU=$(nproc) python3 tools/ab.py /tmp/data 21 /tmp/base /tmp/new
