@@ -9,7 +9,7 @@ on:
         default: "6c87438"
       events:
         description: "Events in the generated dataset"
-        default: "5000000"
+        default: "20000000"
 
 jobs:
   bench:
@@ -45,6 +45,11 @@ jobs:
           /tmp/base /tmp/data /tmp/out-base
           /tmp/new /tmp/data /tmp/out-new
           python3 tools/diff.py /tmp/out-new /tmp/out-base | tail -3
+      - name: Per-stage wall-clock laps of the current build (cumulative, last of 3 runs)
+        run: |
+          for i in 1 2 3; do rm -rf /tmp/out-lap; NCPU=$(nproc) SS_TIMING=1 /tmp/new /tmp/data /tmp/out-lap 2> /tmp/laps.txt; done
+          cat /tmp/laps.txt
+          NCPU=$(nproc) /usr/bin/time -v /tmp/new /tmp/data /tmp/out-rss 2>&1 | grep -E "Maximum resident|Elapsed|Minor|Major" || true
       - name: Interleaved timing (runner has few cores; NCPU is clamped to 1..8)
         run: |
-          NCPU=$(nproc) python3 tools/ab.py /tmp/data 21 /tmp/base /tmp/new
+          NCPU=$(nproc) python3 tools/ab.py /tmp/data 15 /tmp/base /tmp/new
