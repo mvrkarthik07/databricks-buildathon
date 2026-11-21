@@ -10,6 +10,9 @@ on:
       events:
         description: "Events in the generated dataset"
         default: "20000000"
+      only_micro:
+        description: "true: skip base build, tests and A/B; run only the route_rows shard microbenchmark"
+        default: "false"
 
 jobs:
   bench:
@@ -29,10 +32,13 @@ jobs:
         run: |
           cargo build --release --locked
           cp target/release/shopping-sessions /tmp/new
-          git worktree add /tmp/basetree "${{ inputs.base }}"
-          (cd /tmp/basetree && cargo build --release --locked && cp target/release/shopping-sessions /tmp/base)
+          if [ "${{ inputs.only_micro }}" != "true" ]; then
+            git worktree add /tmp/basetree "${{ inputs.base }}"
+            (cd /tmp/basetree && cargo build --release --locked && cp target/release/shopping-sessions /tmp/base)
+          fi
           (cd generator && cargo build --release)
       - name: Unit tests, adversarial fixtures, Python oracle on fresh seeds
+        if: ${{ inputs.only_micro != 'true' }}
         # The 36 published fixtures sit in the git-ignored starter-duckdb/, so they are checked locally only.
         run: |
           cargo test --release --locked
@@ -49,22 +55,33 @@ jobs:
           generator/target/release/generate --seed 20261003 --events "${{ inputs.events }}" \
             --clicks $(( ${{ inputs.events }} / 4 )) --output /tmp/data
       - name: Output matches the base build
+        if: ${{ inputs.only_micro != 'true' }}
         run: |
           /tmp/base /tmp/data /tmp/out-base
           /tmp/new /tmp/data /tmp/out-new
           python3 tools/diff.py /tmp/out-new /tmp/out-base | tail -3
       - name: Per-stage wall-clock laps of the current build (cumulative, last of 3 runs)
+        if: ${{ inputs.only_micro != 'true' }}
         run: |
           for i in 1 2 3; do rm -rf /tmp/out-lap; NCPU=$(nproc) SS_TIMING=1 /tmp/new /tmp/data /tmp/out-lap 2> /tmp/laps.txt; done
           cat /tmp/laps.txt
           NCPU=$(nproc) /usr/bin/time -v /tmp/new /tmp/data /tmp/out-rss 2>&1 | grep -E "Maximum resident|Elapsed|Minor|Major" || true
       - name: Single-thread parse microbenchmark (ns per row, per component)
+        if: ${{ inputs.only_micro != 'true' }}
         run: SS_BENCH=1 /tmp/new /tmp/data /tmp/out-bench 2>&1 | tail -12
       - name: Adaptive shards vs the scored count (output must match the base build)
+        if: ${{ inputs.only_micro != 'true' }}
         run: |
           printf '#!/bin/sh\nSS_SHARDS=64 exec /tmp/new "$@"\n' > /tmp/new-s64; chmod +x /tmp/new-s64
           rm -rf /tmp/out-a; /tmp/new /tmp/data /tmp/out-a; python3 tools/diff.py /tmp/out-a /tmp/out-base | tail -1 | sed 's/^/adaptive: /'
           NCPU=$(nproc) python3 tools/ab.py /tmp/data 15 /tmp/new-s64 /tmp/new
       - name: Interleaved timing against the base build
+        if: ${{ inputs.only_micro != 'true' }}
         run: |
           NCPU=$(nproc) python3 tools/ab.py /tmp/data 15 /tmp/base /tmp/new
+      - name: route_rows ns/row by shard count (single thread)
+        if: ${{ inputs.only_micro == 'true' }}
+        run: |
+          for n in 1 8 64 512 4096; do
+            echo "== SS_SHARDS=$n"; SS_SHARDS=$n SS_BENCH=1 /tmp/new /tmp/data /tmp/o 2>&1 | grep -E "full route_rows|split \(rows:"
+          done
