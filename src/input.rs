@@ -4,7 +4,7 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::ptr::NonNull;
 
-use memchr::{memchr, memchr_iter};
+use memchr::{memchr, memchr2_iter, memchr_iter};
 
 pub const DAY: i64 = 86_400_000;
 pub const WEEK: i64 = 7 * DAY;
@@ -248,4 +248,58 @@ pub fn decimal(raw: &[u8], max: u64) -> Option<u64> {
         value = value * 10 + u64::from(digit);
     }
     (value <= max).then_some(value)
+}
+
+/// Calls `f` with the N cleaned fields of every well-formed line, exactly as `fields::<N>` does
+/// per `lines` item, but with a single vectorised scan for both separators.
+#[inline]
+pub fn rows<'a, const N: usize>(bytes: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
+    let mut ends = [0usize; N];
+    let mut count = 0usize;
+    let mut line_start = 0usize;
+    for p in memchr2_iter(b',', b'\n', bytes) {
+        if bytes[p] == b',' {
+            if count < N - 1 {
+                ends[count] = p;
+            }
+            count += 1;
+        } else {
+            if count == N - 1 {
+                ends[N - 1] = p;
+                emit(bytes, line_start, &ends, &mut f);
+            }
+            count = 0;
+            line_start = p + 1;
+        }
+    }
+    if count == N - 1 && line_start <= bytes.len() {
+        ends[N - 1] = bytes.len();
+        emit(bytes, line_start, &ends, &mut f);
+    }
+}
+
+#[inline(always)]
+fn emit<'a, const N: usize>(
+    bytes: &'a [u8],
+    line_start: usize,
+    ends: &[usize; N],
+    f: &mut impl FnMut([&'a [u8]; N]),
+) {
+    let line = &bytes[line_start..ends[N - 1]];
+    let quoted = memchr(b'"', line).is_some();
+    let mut out = [&[][..]; N];
+    let mut start = line_start;
+    for k in 0..N {
+        let value = &bytes[start..ends[k]];
+        start = ends[k] + 1;
+        out[k] = if quoted {
+            match field(value) {
+                Some(value) => value,
+                None => return,
+            }
+        } else {
+            value
+        };
+    }
+    f(out);
 }

@@ -13,7 +13,7 @@ use hashbrown::HashTable;
 use hashbrown::hash_table::Entry;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHasher};
 
-use input::{DAY, GAP, Mapped, WEEK, chunk_batches, csv_files, decimal, fields, lines, timestamp};
+use input::{DAY, GAP, Mapped, WEEK, chunk_batches, csv_files, decimal, fields, lines, rows, timestamp};
 use output::{CampaignRow, UserRow};
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
@@ -193,10 +193,9 @@ fn transpose<T>(sources: Vec<Vec<Vec<T>>>, shards: usize) -> Vec<Vec<Vec<T>>> {
     destinations
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct Event {
     ts: i64,
-    person: u32,
     price: u32,
     category: u32,
 }
@@ -220,11 +219,10 @@ struct NamedEvent<'a> {
     event: Event,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct Click<'a> {
     ts: i64,
     id: Text<'a>,
-    person: u32,
     campaign: u32,
 }
 
@@ -246,12 +244,10 @@ fn route_rows<'a>(
     end: i64,
 ) -> Vec<Vec<Row<'a>>> {
     let mut shards: Vec<Vec<Row>> = (0..DEDUP_SHARDS).map(|_| Vec::new()).collect();
-    for line in chunks.into_iter().flat_map(lines) {
-        let Some([id, user, ts, ingest, kind, product, price]) = fields(line) else {
-            continue;
-        };
+    for chunk in chunks {
+        rows::<7>(chunk, |[id, user, ts, ingest, kind, product, price]| {
         if id.is_empty() || ingest.len() != 20 {
-            continue;
+            return;
         }
         let hash = hash(id);
         // Keep shard bits separate from hashbrown's low bucket bits and top seven tag bits.
@@ -292,6 +288,7 @@ fn route_rows<'a>(
             category,
             ingest: ingest.try_into().unwrap(),
             valid: parsed.is_some(),
+        });
         });
     }
     shards
@@ -360,7 +357,6 @@ fn dedup_events<'a>(
                     ts: row.ts,
                     price: row.price,
                     category: row.category,
-                    person: 0,
                 },
             });
         }
@@ -377,19 +373,20 @@ fn route_clicks<'a>(
     workers: usize,
 ) -> Vec<Vec<NamedClick<'a>>> {
     let mut routed: Vec<Vec<NamedClick>> = (0..workers).map(|_| Vec::new()).collect();
-    for [id, user, campaign, ts] in chunks.into_iter().flat_map(lines).filter_map(fields::<4>) {
+    for chunk in chunks {
+        rows::<4>(chunk, |[id, user, campaign, ts]| {
         if id.is_empty() || user.is_empty() {
-            continue;
+            return;
         }
         let Some(&campaign) = catalog.campaigns.ids.get(campaign) else {
-            continue;
+            return;
         };
         if campaign == catalog.organic {
-            continue;
+            return;
         }
-        let Some(ts) = timestamp(ts) else { continue };
+        let Some(ts) = timestamp(ts) else { return };
         if ts < start - WEEK || ts >= end {
-            continue;
+            return;
         }
         let name = if people.is_empty() {
             user
@@ -404,8 +401,8 @@ fn route_clicks<'a>(
                 ts,
                 id,
                 campaign,
-                person: 0,
             },
+        });
         });
     }
     routed
@@ -421,55 +418,92 @@ struct CampaignTotals {
 
 type CampaignDaily = FxHashMap<(u32, i32), CampaignTotals>;
 
+/// Groups `items` by person with a counting sort. Returns the grouped items and, for each
+/// person, the start of their range (one extra entry marks the end).
+fn group_by_person<T: Copy + Default>(
+    items: impl Iterator<Item = (u32, T)> + Clone,
+    count: usize,
+    people: usize,
+) -> (Vec<T>, Vec<u32>) {
+    let mut start = vec![0u32; people + 1];
+    for (person, _) in items.clone() {
+        start[person as usize + 1] += 1;
+    }
+    for i in 0..people {
+        start[i + 1] += start[i];
+    }
+    let mut next = start[..people].to_vec();
+    let mut grouped = vec![T::default(); count];
+    for (person, item) in items {
+        let slot = &mut next[person as usize];
+        grouped[*slot as usize] = item;
+        *slot += 1;
+    }
+    (grouped, start)
+}
+
 fn aggregate<'a>(
     event_batches: Vec<Vec<NamedEvent<'a>>>,
     click_batches: Vec<Vec<NamedClick<'a>>>,
     catalog: &Catalog<'a>,
 ) -> (Vec<UserRow<'a>>, CampaignDaily) {
     let mut people = People::default();
-    let mut events = Vec::with_capacity(event_batches.iter().map(Vec::len).sum());
-    for NamedEvent {
-        name,
-        hash,
-        mut event,
-    } in event_batches.into_iter().flatten()
-    {
-        event.person = people.intern(name, hash);
-        events.push(event);
+    let event_count: usize = event_batches.iter().map(Vec::len).sum();
+    let mut event_person = Vec::with_capacity(event_count);
+    for event in event_batches.iter().flatten() {
+        event_person.push(people.intern(event.name, event.hash));
     }
-    let mut clicks = Vec::with_capacity(click_batches.iter().map(Vec::len).sum());
-    for NamedClick {
-        name,
-        hash,
-        mut click,
-    } in click_batches.into_iter().flatten()
-    {
-        if let Some(person) = people.find(name, hash) {
-            click.person = person;
-            clicks.push(click);
-        }
+    let mut click_person = Vec::with_capacity(click_batches.iter().map(Vec::len).sum());
+    for click in click_batches.iter().flatten() {
+        click_person.push(people.find(click.name, click.hash));
     }
-    events.sort_unstable_by_key(|event| (event.person, event.ts));
-    // At a tied timestamp the last click must have the smallest byte ID.
-    clicks.sort_unstable_by_key(|click| (click.person, click.ts, Reverse(click.id)));
-    // Identical click copies have the same validity and always reach the same person.
-    clicks.dedup_by_key(|click| (click.person, click.ts, click.id));
+    let person_count = people.names.len();
+    let (mut events, event_start) = group_by_person(
+        event_batches
+            .iter()
+            .flatten()
+            .zip(&event_person)
+            .map(|(event, &person)| (person, event.event)),
+        event_count,
+        person_count,
+    );
+    let click_count = click_person.iter().flatten().count();
+    let (mut clicks, click_start) = group_by_person(
+        click_batches
+            .iter()
+            .flatten()
+            .zip(&click_person)
+            .filter_map(|(click, person)| person.map(|person| (person, click.click))),
+        click_count,
+        person_count,
+    );
+    drop((event_batches, click_batches, event_person, click_person));
 
     let mut users = Vec::new();
     let mut campaigns = CampaignDaily::default();
-    let mut remaining_clicks = clicks.as_slice();
     let mut spend = vec![0i64; catalog.categories.names.len()];
     let mut touched = Vec::new();
     let mut active: FxHashMap<u32, usize> = FxHashMap::with_hasher(FxBuildHasher);
 
-    for person_events in events.chunk_by(|a, b| a.person == b.person) {
-        let person = person_events[0].person;
-        let name = people.names[person as usize];
-        let begin = remaining_clicks.partition_point(|click| click.person < person);
-        remaining_clicks = &remaining_clicks[begin..];
-        let end = remaining_clicks.partition_point(|click| click.person == person);
-        let (person_clicks, rest) = remaining_clicks.split_at(end);
-        remaining_clicks = rest;
+    for person in 0..person_count {
+        let name = people.names[person];
+        let person_events = &mut events[event_start[person] as usize..event_start[person + 1] as usize];
+        person_events.sort_unstable_by_key(|event| event.ts);
+        // At a tied timestamp the last click must have the smallest byte ID.
+        let person_clicks = &mut clicks[click_start[person] as usize..click_start[person + 1] as usize];
+        person_clicks.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| b.id.cmp(a.id)));
+        // Identical click copies have the same validity and always reach the same person.
+        let mut kept = 0;
+        for i in 0..person_clicks.len() {
+            if kept == 0
+                || person_clicks[kept - 1].ts != person_clicks[i].ts
+                || person_clicks[kept - 1].id != person_clicks[i].id
+            {
+                person_clicks[kept] = person_clicks[i];
+                kept += 1;
+            }
+        }
+        let person_clicks = &person_clicks[..kept];
 
         let mut daily = UserRow::new(name);
         let mut first = 0;
