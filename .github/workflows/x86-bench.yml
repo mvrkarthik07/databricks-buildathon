@@ -24,7 +24,7 @@ jobs:
           echo "flags: $(grep -m1 flags /proc/cpuinfo | tr ' ' '\n' | grep -E '^(avx2|avx512[a-z_0-9]*|bmi2|popcnt)$' | sort -u | tr '\n' ' ')"
           free -m | head -2
       - uses: dtolnay/rust-toolchain@stable
-      - run: pip install pyarrow
+      - run: pip install -r ref/requirements.txt
       - name: Build current and base
         run: |
           cargo build --release --locked
@@ -32,10 +32,18 @@ jobs:
           git worktree add /tmp/basetree "${{ inputs.base }}"
           (cd /tmp/basetree && cargo build --release --locked && cp target/release/shopping-sessions /tmp/base)
           (cd generator && cargo build --release)
-      - name: Unit tests and published fixtures
+      - name: Unit tests, adversarial fixtures, Python oracle on fresh seeds
+        # The 36 published fixtures sit in the git-ignored starter-duckdb/, so they are checked locally only.
         run: |
           cargo test --release --locked
-          make check-fixtures check-adversarial PYTHON=python3 REF=/tmp/new
+          make check-adversarial PYTHON=python3 REF=/tmp/new
+          for seed in 11 22 33; do
+            generator/target/release/generate --seed $seed --events 200000 --clicks 50000 --output /tmp/small$seed
+            python3 ref/reference.py /tmp/small$seed /tmp/oracle$seed > /dev/null
+            /tmp/new /tmp/small$seed /tmp/new$seed
+            echo "seed $seed: $(python3 tools/diff.py /tmp/new$seed /tmp/oracle$seed | tail -1)"
+            python3 tools/diff.py /tmp/new$seed /tmp/oracle$seed | grep -q '^MATCH'
+          done
       - name: Dataset
         run: |
           generator/target/release/generate --seed 20261003 --events "${{ inputs.events }}" \
