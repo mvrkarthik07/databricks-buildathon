@@ -13,7 +13,7 @@ use hashbrown::HashTable;
 use hashbrown::hash_table::Entry;
 use rustc_hash::{FxHashMap, FxHasher};
 
-use input::{
+use input::{rows_scalar, 
     DAY, Dates, GAP, Mapped, WEEK, chunk_batches, csv_files, decimal, fields, lines, rows, timestamp,
     timestamp_cached, will_need,
 };
@@ -21,10 +21,22 @@ use output::{CampaignRow, UserRow};
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 type Text<'a> = &'a [u8];
-/// Experiment knob: `SS_SHARDS` overrides the dedup shard count (default 64).
+/// Rows per dedup shard that keep a shard's hash table (about 24 bytes a row) inside a 2 MiB L2.
+const SHARD_ROWS: usize = 40_000;
+
+static SHARDS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// The number of dedup shards: `SS_SHARDS` if set (an experiment knob), else enough that each
+/// shard's table stays cache-resident for `event_bytes` of input (about 88 bytes a row).
 fn dedup_shards() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| env::var("SS_SHARDS").ok().and_then(|s| s.parse().ok()).unwrap_or(64))
+    *SHARDS.get_or_init(|| 64)
+}
+
+fn choose_shards(event_bytes: usize) -> usize {
+    if let Some(n) = env::var("SS_SHARDS").ok().and_then(|s| s.parse::<usize>().ok()) {
+        return n.max(1);
+    }
+    (event_bytes / 88 / SHARD_ROWS).next_power_of_two().clamp(32, 4096)
 }
 
 /// Sums of per-thread stage times, printed with `SS_TIMING`.
@@ -981,6 +993,51 @@ fn flush_daily<'a>(
     out.push(row);
 }
 
+/// Single-thread parse microbenchmark (`SS_BENCH=1`): ns per event row for each parse component.
+fn bench_parse(files: &[Mapped], catalog: &Catalog, start: i64, end: i64) {
+    let chunks: Vec<Text> = chunk_batches(files, 1).into_iter().flatten().collect();
+    let mut dates = Dates::new();
+    let mut rows_seen = 0usize;
+    rows::<7>(chunks[0], |_| rows_seen += 1);
+    let total: usize = chunks.iter().map(|chunk| {
+        let mut n = 0;
+        rows::<7>(chunk, |_| n += 1);
+        n
+    }).sum();
+    let report = |name: &str, t: std::time::Instant, sink: u64| {
+        eprintln!("{name:34} {:6.1} ns/row   (sink {sink})", t.elapsed().as_nanos() as f64 / total as f64);
+    };
+    let mut sink = 0u64;
+    let t = std::time::Instant::now();
+    for &chunk in &chunks { rows::<7>(chunk, |r| sink += r[0].len() as u64); }
+    report("split (rows: avx2 if available)", t, sink);
+    let t = std::time::Instant::now();
+    for &chunk in &chunks { rows_scalar::<7>(chunk, |r| sink += r[0].len() as u64); }
+    report("split (rows_scalar, memchr2)", t, sink);
+    let t = std::time::Instant::now();
+    for &chunk in &chunks { rows::<7>(chunk, |r| sink ^= hash(r[0])); }
+    report("split + hash(event_id)", t, sink);
+    let t = std::time::Instant::now();
+    for &chunk in &chunks { rows::<7>(chunk, |r| sink ^= hash(r[1]) ^ hash2(r[1])); }
+    report("split + hash,hash2(user)", t, sink);
+    let t = std::time::Instant::now();
+    for &chunk in &chunks {
+        rows::<7>(chunk, |r| {
+            sink ^= timestamp_cached(r[2], &mut dates).unwrap_or(0) as u64
+                ^ timestamp_cached(r[3], &mut dates).unwrap_or(0) as u64
+        });
+    }
+    report("split + ts + ingest parse", t, sink);
+    let t = std::time::Instant::now();
+    for &chunk in &chunks { rows::<7>(chunk, |r| if r[4] == b"purchase" { sink += decimal(r[6], 10_000_000).unwrap_or(0) }); }
+    report("split + kind/price", t, sink);
+    let indexed: Vec<(u32, Text)> = chunks.iter().enumerate().map(|(i, &c)| (i as u32, c)).collect();
+    let t = std::time::Instant::now();
+    let shards = route_rows(indexed, catalog, start, end);
+    report("full route_rows", t, shards.iter().map(Vec::len).sum::<usize>() as u64);
+    eprintln!("rows: {total}, bytes: {}", chunks.iter().map(|c| c.len()).sum::<usize>());
+}
+
 fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
     let t = std::time::Instant::now();
     let timing = env::var_os("SS_TIMING").is_some();
@@ -1020,7 +1077,13 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
         (catalog.join().unwrap(), files)
     });
     let (links, event_files, click_files) = files?;
+    let event_bytes: usize = event_files.iter().map(|file| file.bytes().len()).sum();
+    SHARDS.set(choose_shards(event_bytes)).expect("shard count is chosen once");
     lap("catalog + files");
+    if env::var_os("SS_BENCH").is_some() {
+        bench_parse(&event_files, &catalog, start, end);
+        std::process::exit(0);
+    }
     let (event_chunks, event_batches) = index_chunks(chunk_batches(&event_files, workers))?;
     let link_rows = parallel(chunk_batches(&links, workers), workers, parse_links);
     lap("link parse");

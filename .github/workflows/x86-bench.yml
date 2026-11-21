@@ -58,14 +58,13 @@ jobs:
           for i in 1 2 3; do rm -rf /tmp/out-lap; NCPU=$(nproc) SS_TIMING=1 /tmp/new /tmp/data /tmp/out-lap 2> /tmp/laps.txt; done
           cat /tmp/laps.txt
           NCPU=$(nproc) /usr/bin/time -v /tmp/new /tmp/data /tmp/out-rss 2>&1 | grep -E "Maximum resident|Elapsed|Minor|Major" || true
-      - name: Dedup shard sweep (one binary, SS_SHARDS env; each output must match the base build)
+      - name: Single-thread parse microbenchmark (ns per row, per component)
+        run: SS_BENCH=1 /tmp/new /tmp/data /tmp/out-bench 2>&1 | tail -12
+      - name: Adaptive shards vs the scored count (output must match the base build)
         run: |
-          for n in 32 64 128 256 512 1024 2048; do
-            printf '#!/bin/sh\nSS_SHARDS=%s exec /tmp/new "$@"\n' $n > /tmp/new-s$n; chmod +x /tmp/new-s$n
-            rm -rf /tmp/out-s; /tmp/new-s$n /tmp/data /tmp/out-s
-            python3 tools/diff.py /tmp/out-s /tmp/out-base | tail -1 | sed "s/^/shards $n: /"
-          done
-          NCPU=$(nproc) python3 tools/ab.py /tmp/data 15 /tmp/new-s32 /tmp/new-s64 /tmp/new-s128 /tmp/new-s256 /tmp/new-s512 /tmp/new-s1024 /tmp/new-s2048
+          printf '#!/bin/sh\nSS_SHARDS=64 exec /tmp/new "$@"\n' > /tmp/new-s64; chmod +x /tmp/new-s64
+          rm -rf /tmp/out-a; /tmp/new /tmp/data /tmp/out-a; python3 tools/diff.py /tmp/out-a /tmp/out-base | tail -1 | sed 's/^/adaptive: /'
+          NCPU=$(nproc) python3 tools/ab.py /tmp/data 15 /tmp/new-s64 /tmp/new
       - name: Interleaved timing against the base build
         run: |
           NCPU=$(nproc) python3 tools/ab.py /tmp/data 15 /tmp/base /tmp/new

@@ -381,7 +381,7 @@ pub fn rows<'a, const N: usize>(bytes: &'a [u8], f: impl FnMut([&'a [u8]; N])) {
 }
 
 #[inline]
-fn rows_scalar<'a, const N: usize>(bytes: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
+pub fn rows_scalar<'a, const N: usize>(bytes: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
     let mut ends = [0usize; N];
     let mut count = 0usize;
     let mut line_start = 0usize;
