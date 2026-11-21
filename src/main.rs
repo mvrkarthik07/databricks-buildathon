@@ -318,7 +318,6 @@ struct Click<'a> {
 }
 
 struct NamedClick<'a> {
-    name: Text<'a>,
     hash: u64,
     hash2: u64,
     click: Click<'a>,
@@ -487,12 +486,11 @@ fn route_clicks<'a>(
             return;
         }
         let user_hash = crate::hash(user);
-        let (name, hash, hash2) = match people.resolve(user, user_hash) {
-            Some(name) => (name, crate::hash(name), self::hash2(name)),
-            None => (user, user_hash, self::hash2(user)),
+        let (hash, hash2) = match people.resolve(user, user_hash) {
+            Some(name) => (crate::hash(name), self::hash2(name)),
+            None => (user_hash, self::hash2(user)),
         };
         routed[worker_of(hash, workers)].push(NamedClick {
-            name,
             hash,
             hash2,
             click: Click {

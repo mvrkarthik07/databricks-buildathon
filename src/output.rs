@@ -64,6 +64,7 @@ type Sink = BufWriter<File>;
 fn open(path: &Path, schema: &str) -> Result<SerializedFileWriter<Sink>> {
     let props = WriterProperties::builder()
         .set_statistics_enabled(EnabledStatistics::None)
+        .set_dictionary_enabled(false)
         .build();
     let file = BufWriter::with_capacity(256 * 1024, File::create(path)?);
     SerializedFileWriter::new(file, Arc::new(parse_message_type(schema)?), Arc::new(props))
