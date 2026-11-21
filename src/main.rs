@@ -89,8 +89,9 @@ impl<'a> People<'a> {
             .copied()
     }
 
+    /// `name` is only called for a person seen for the first time.
     #[inline]
-    fn intern(&mut self, name: Text<'a>, hash: u64, hash2: u64) -> u32 {
+    fn intern(&mut self, hash: u64, hash2: u64, name: impl FnOnce() -> Text<'a>) -> u32 {
         let keys = &mut self.keys;
         match self.table.entry(
             hash,
@@ -101,7 +102,7 @@ impl<'a> People<'a> {
             Entry::Vacant(entry) => {
                 let id = u32::try_from(keys.len()).expect("too many distinct people");
                 keys.push((hash, hash2));
-                self.names.push(name);
+                self.names.push(name());
                 entry.insert(id);
                 id
             }
@@ -248,17 +249,20 @@ fn build_links<'a>(link_rows: Vec<Vec<LinkRow<'a>>>) -> Links<'a> {
         }
     }
     let mut links = Links::with_capacity(count);
+    // Dense index of each person that has another ID, assigned in order of first use.
+    let mut person_of = vec![u32::MAX; count];
     for id in 0..count {
         let target = smallest[root(&mut parents, id as u32) as usize] as usize;
         if target != id {
-            links.insert(
-                keys[id],
-                LinkTarget {
+            if person_of[target] == u32::MAX {
+                person_of[target] = u32::try_from(links.persons.len()).expect("too many people");
+                links.persons.push(LinkTarget {
                     name: names[target],
                     hash: keys[target].0,
                     hash2: keys[target].1,
-                },
-            );
+                });
+            }
+            links.insert(keys[id], person_of[target]);
         }
     }
     links
@@ -271,11 +275,20 @@ struct LinkTarget<'a> {
     hash2: u64,
 }
 
-/// Maps a linked ID to the person's smallest ID, found by the ID's two hashes. IDs that are
-/// their own person are absent. A one-hash bloom filter answers the common "not linked" case
-/// without touching the table.
+#[derive(Clone, Copy)]
+struct LinkSlot {
+    key: (u64, u64),
+    /// The person's own two hashes, so routing an event needs no second memory access.
+    target: (u64, u64),
+    person: u32,
+}
+
+/// Maps a linked ID to its person, found by the ID's two hashes. IDs that are their own person
+/// are absent. A one-hash bloom filter answers the common "not linked" case without touching the
+/// table. Slots hold a dense person index; the person's name and hashes live in `persons`.
 struct Links<'a> {
-    table: HashTable<((u64, u64), LinkTarget<'a>)>,
+    table: HashTable<LinkSlot>,
+    persons: Vec<LinkTarget<'a>>,
     bloom: Vec<u64>,
     shift: u32,
 }
@@ -285,27 +298,52 @@ impl<'a> Links<'a> {
         let bits = (count.max(1) * 32).next_power_of_two().max(64);
         Links {
             table: HashTable::with_capacity(count),
+            persons: Vec::new(),
             bloom: vec![0; bits / 64],
             shift: 64 - bits.trailing_zeros(),
         }
     }
 
-    fn insert(&mut self, key: (u64, u64), target: LinkTarget<'a>) {
+    fn insert(&mut self, key: (u64, u64), person: u32) {
         let bit = (key.0 >> self.shift) as usize;
         self.bloom[bit / 64] |= 1 << (bit % 64);
-        self.table.insert_unique(key.0, (key, target), |e| e.0.0);
+        let target = &self.persons[person as usize];
+        let slot = LinkSlot { key, target: (target.hash, target.hash2), person };
+        self.table.insert_unique(key.0, slot, |slot| slot.key.0);
     }
 
+    /// The person this ID belongs to, if the ID is linked to another.
     #[inline]
-    fn resolve(&self, hash: u64, hash2: u64) -> Option<LinkTarget<'a>> {
+    fn resolve(&self, hash: u64, hash2: u64) -> Option<&LinkSlot> {
         let bit = (hash >> self.shift) as usize;
         if self.bloom[bit / 64] >> (bit % 64) & 1 == 0 {
             return None;
         }
         self.table
-            .find(hash, |e| e.0 == (hash, hash2))
-            .map(|e| e.1)
+            .find(hash, |slot| slot.key == (hash, hash2))
     }
+}
+
+/// Numbers every chunk, so a record can name its line as (chunk, offset) in 8 bytes. Fails only
+/// for a line longer than 4 GiB (chunks are about 4 MiB plus one line), which the 32-bit offsets
+/// cannot address.
+fn index_chunks<'a>(
+    batches: Vec<Vec<Text<'a>>>,
+) -> Result<(Vec<Text<'a>>, Vec<Vec<(u32, Text<'a>)>>)> {
+    let mut table = Vec::new();
+    let mut indexed = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let mut out = Vec::with_capacity(batch.len());
+        for chunk in batch {
+            if chunk.len() > u32::MAX as usize || table.len() >= 1 << 31 {
+                return Err(io::Error::other("an events line longer than 4 GiB is not supported").into());
+            }
+            out.push((table.len() as u32, chunk));
+            table.push(chunk);
+        }
+        indexed.push(out);
+    }
+    Ok((table, indexed))
 }
 
 fn parallel<T: Send, U: Send>(jobs: Vec<T>, workers: usize, run: impl Fn(T) -> U + Sync) -> Vec<U> {
@@ -348,23 +386,75 @@ struct Event {
     category: u32,
 }
 
+/// Where an input line starts: its chunk's index in the chunk table and the byte offset in it.
+/// Fields that few rows ever need (the event ID bytes, the ingest time, the user name) are read
+/// again from here instead of being carried by every record.
+#[derive(Clone, Copy)]
+struct Line {
+    chunk: u32,
+    offset: u32,
+}
+
+/// Field `index` of an event line, cleaned of its quotes. Scans only up to that field.
+fn cold_field<'a>(chunks: &[Text<'a>], line: Line, index: usize) -> Text<'a> {
+    let chunk = chunks[line.chunk as usize];
+    let mut start = line.offset as usize;
+    for _ in 0..index {
+        // The line was accepted by `rows`, so it has all seven fields: these commas exist.
+        start += memchr::memchr(b',', &chunk[start..]).expect("line was already parsed") + 1;
+    }
+    let end = start + memchr::memchr(b',', &chunk[start..]).expect("line was already parsed");
+    match &chunk[start..end] {
+        [b'"', inner @ .., b'"'] => inner,
+        value => value,
+    }
+}
+
 /// One parsed copy of an event row. Validity is settled per copy, but only the winning copy of
 /// each event ID (the earliest ingest) is allowed to count.
-struct Row<'a> {
+#[derive(Clone, Copy)]
+struct Row {
     hash: u64,
-    id: Text<'a>,
-    user: Text<'a>,
     user_hash: u64,
     user_hash2: u64,
     ts: i64,
     price: u32,
+    /// `INVALID` when the copy fails validation. Real categories are dense indexes into the
+    /// products file, far below `u32::MAX`.
     category: u32,
-    ingest: [u8; 20],
-    valid: bool,
+    line: Line,
 }
 
-struct NamedEvent<'a> {
-    name: Text<'a>,
+const INVALID: u32 = u32::MAX;
+
+/// Where a person's name bytes are: in a linked person's record (top bit set), or on the line of
+/// one of their events (a person with a single ID is named by that ID).
+#[derive(Clone, Copy)]
+struct NameRef(u64);
+
+impl NameRef {
+    const LINKED: u64 = 1 << 63;
+
+    fn linked(person: u32) -> Self {
+        Self(Self::LINKED | u64::from(person))
+    }
+
+    fn line(line: Line) -> Self {
+        Self(u64::from(line.chunk) << 32 | u64::from(line.offset))
+    }
+
+    fn text<'a>(self, chunks: &[Text<'a>], links: &Links<'a>) -> Text<'a> {
+        if self.0 & Self::LINKED != 0 {
+            links.persons[(self.0 & !Self::LINKED) as usize].name
+        } else {
+            let line = Line { chunk: (self.0 >> 32) as u32, offset: self.0 as u32 };
+            cold_field(chunks, line, 1)
+        }
+    }
+}
+
+struct NamedEvent {
+    name: NameRef,
     hash: u64,
     hash2: u64,
     event: Event,
@@ -389,26 +479,29 @@ fn worker_of(hash: u64, workers: usize) -> usize {
 }
 
 fn route_rows<'a>(
-    chunks: Vec<&'a [u8]>,
+    chunks: Vec<(u32, Text<'a>)>,
     catalog: &Catalog<'a>,
     start: i64,
     end: i64,
-) -> Vec<Vec<Row<'a>>> {
-    let lines: usize = chunks.iter().map(|chunk| memchr::memchr_iter(b'\n', chunk).count()).sum();
+) -> Vec<Vec<Row>> {
+    let lines: usize = chunks.iter().map(|(_, chunk)| memchr::memchr_iter(b'\n', chunk).count()).sum();
     let share = lines / DEDUP_SHARDS + lines / DEDUP_SHARDS / 16 + 64;
     let mut shards: Vec<Vec<Row>> = (0..DEDUP_SHARDS).map(|_| Vec::with_capacity(share)).collect();
     let mut dates = Dates::new();
-    for chunk in chunks.iter().take(2) {
+    for (_, chunk) in chunks.iter().take(2) {
         will_need(chunk);
     }
-    for (index, &chunk) in chunks.iter().enumerate() {
-        if let Some(ahead) = chunks.get(index + 2) {
+    for (index, &(chunk_index, chunk)) in chunks.iter().enumerate() {
+        if let Some((_, ahead)) = chunks.get(index + 2) {
             will_need(ahead);
         }
         rows::<7>(chunk, |[id, user, ts, ingest, kind, product, price]| {
         if id.is_empty() || ingest.len() != 20 {
             return;
         }
+        // A quoted first field is preceded by its quote; an unquoted one by the previous newline.
+        let at = id.as_ptr().addr() - chunk.as_ptr().addr();
+        let offset = at - usize::from(at > 0 && chunk[at - 1] == b'"');
         let hash = hash(id);
         // Keep shard bits separate from hashbrown's low bucket bits (below 2^32 buckets) and its
         // top seven tag bits.
@@ -439,18 +532,16 @@ fn route_rows<'a>(
             }
             Some((ts, price, category))
         })();
-        let (ts, price, category) = parsed.unwrap_or((0, 0, 0));
+        let (ts, price, category) = parsed.unwrap_or((0, 0, INVALID));
         shards[shard].push(Row {
             hash,
-            id,
-            user,
             user_hash: crate::hash(user),
             user_hash2: hash2(user),
             ts,
             price,
             category,
-            ingest: ingest.try_into().unwrap(),
-            valid: parsed.is_some(),
+            // `chunk_index` and every chunk length were checked by `index_chunks`.
+            line: Line { chunk: chunk_index, offset: offset as u32 },
         });
         });
     }
@@ -465,10 +556,11 @@ struct Slot {
 }
 
 fn dedup_events<'a>(
-    batches: Vec<Vec<Row<'a>>>,
+    batches: Vec<Vec<Row>>,
     people: &Links<'a>,
+    chunks: &[Text<'a>],
     workers: usize,
-) -> Vec<Vec<NamedEvent<'a>>> {
+) -> Vec<Vec<NamedEvent>> {
     let total: usize = batches.iter().map(Vec::len).sum();
     let mut kept: HashTable<Slot> = HashTable::with_capacity(total);
     for (b, batch) in batches.iter().enumerate() {
@@ -482,7 +574,8 @@ fn dedup_events<'a>(
                 row.hash,
                 |old| {
                     old.hash == row.hash
-                        && batches[old.batch as usize][old.pos as usize].id == row.id
+                        && cold_field(chunks, batches[old.batch as usize][old.pos as usize].line, 0)
+                            == cold_field(chunks, row.line, 0)
                 },
                 |slot| slot.hash,
             ) {
@@ -491,7 +584,7 @@ fn dedup_events<'a>(
                 }
                 Entry::Occupied(mut entry) => {
                     let old = &batches[entry.get().batch as usize][entry.get().pos as usize];
-                    if row.ingest < old.ingest {
+                    if cold_field(chunks, row.line, 3) < cold_field(chunks, old.line, 3) {
                         *entry.get_mut() = slot;
                     }
                 }
@@ -507,10 +600,10 @@ fn dedup_events<'a>(
     let share = total / workers + total / workers / 8 + 16;
     let mut routed: Vec<Vec<NamedEvent>> = (0..workers).map(|_| Vec::with_capacity(share)).collect();
     for (batch, winner) in batches.iter().zip(&winner) {
-        for (row, _) in batch.iter().zip(winner).filter(|&(row, &win)| win && row.valid) {
+        for (row, _) in batch.iter().zip(winner).filter(|&(row, &win)| win && row.category != INVALID) {
             let (name, hash, hash2) = match people.resolve(row.user_hash, row.user_hash2) {
-                Some(target) => (target.name, target.hash, target.hash2),
-                None => (row.user, row.user_hash, row.user_hash2),
+                Some(slot) => (NameRef::linked(slot.person), slot.target.0, slot.target.1),
+                None => (NameRef::line(row.line), row.user_hash, row.user_hash2),
             };
             routed[worker_of(hash, workers)].push(NamedEvent {
                 name,
@@ -560,7 +653,7 @@ fn route_clicks<'a>(
         }
         let (user_hash, user_hash2) = (crate::hash(user), self::hash2(user));
         let (hash, hash2) = match people.resolve(user_hash, user_hash2) {
-            Some(target) => (target.hash, target.hash2),
+            Some(slot) => slot.target,
             None => (user_hash, user_hash2),
         };
         routed[worker_of(hash, workers)].push(NamedClick {
@@ -723,16 +816,18 @@ fn group_by_person<T: Copy + Default>(
 }
 
 fn aggregate<'a>(
-    event_batches: Vec<Vec<NamedEvent<'a>>>,
+    event_batches: Vec<Vec<NamedEvent>>,
     click_batches: Vec<Vec<NamedClick<'a>>>,
     catalog: &Catalog<'a>,
     (first_day, last_day): (i32, i32),
+    chunks: &[Text<'a>],
+    links: &Links<'a>,
 ) -> (Vec<UserRow<'a>>, DailyTotals) {
     let mut people = People::default();
     let event_count: usize = event_batches.iter().map(Vec::len).sum();
     let mut event_person = Vec::with_capacity(event_count);
     for event in event_batches.iter().flatten() {
-        event_person.push(people.intern(event.name, event.hash, event.hash2));
+        event_person.push(people.intern(event.hash, event.hash2, || event.name.text(chunks, links)));
     }
     let mut click_person = Vec::with_capacity(click_batches.iter().map(Vec::len).sum());
     for click in click_batches.iter().flatten() {
@@ -903,6 +998,7 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
     });
     let (links, event_files, click_files) = files?;
     lap("catalog + files");
+    let (event_chunks, event_batches) = index_chunks(chunk_batches(&event_files, workers))?;
     let link_rows = parallel(chunk_batches(&links, workers), workers, parse_links);
     lap("link parse");
     let (people, copies) = thread::scope(|scope| {
@@ -914,14 +1010,14 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
             }
             people
         });
-        let copies = parallel(chunk_batches(&event_files, workers), workers, |chunks| {
+        let copies = parallel(event_batches, workers, |chunks| {
             route_rows(chunks, &catalog, start, end)
         });
         (people.join().unwrap(), copies)
     });
     lap("links+route");
     let events = parallel(transpose(copies, DEDUP_SHARDS), workers, |batches| {
-        dedup_events(batches, &people, workers)
+        dedup_events(batches, &people, &event_chunks, workers)
     });
     lap("dedup");
     let clicks = parallel(chunk_batches(&click_files, workers), workers, |chunks| {
@@ -944,7 +1040,7 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
         jobs,
         workers,
         |(shard, (events, clicks))| -> Result<DailyTotals> {
-            let (users, campaigns) = aggregate(events, clicks, &catalog, days);
+            let (users, campaigns) = aggregate(events, clicks, &catalog, days, &event_chunks, &people);
             if shard == 0 || !users.is_empty() {
                 output::users(&user_folder.join(format!("part-{shard}.parquet")), &users)?;
             }
@@ -1022,6 +1118,25 @@ mod tests {
     fn next(state: &mut u64) -> u64 {
         *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         *state >> 33
+    }
+
+    #[test]
+    fn cold_fields_read_back_each_line() {
+        let chunk: &[u8] = b"e1,\"u1\",ts,2026-10-01T00:00:00Z,view,p,0\n\"e2\",u2,ts,\"2026-10-01T00:00:01Z\",view,p,0\ne3,u3,ts,2026-10-01T00:00:02Z,view,p,0";
+        let chunks = [b"ignored".as_slice(), chunk];
+        let mut seen = Vec::new();
+        // Line starts are what `route_rows` derives from the first field, quoted or not.
+        crate::input::rows::<7>(chunk, |fields| {
+            let at = fields[0].as_ptr().addr() - chunk.as_ptr().addr();
+            let offset = at - usize::from(at > 0 && chunk[at - 1] == b'"');
+            seen.push((fields, Line { chunk: 1, offset: offset as u32 }));
+        });
+        assert_eq!(seen.len(), 3);
+        for (fields, line) in seen {
+            assert_eq!(cold_field(&chunks, line, 0), fields[0]);
+            assert_eq!(cold_field(&chunks, line, 1), fields[1]);
+            assert_eq!(cold_field(&chunks, line, 3), fields[3]);
+        }
     }
 
     #[test]
