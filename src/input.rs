@@ -15,6 +15,10 @@ pub struct Mapped {
     len: usize,
 }
 
+// The mapping is read-only and never mutated, so sharing it across threads is sound.
+unsafe impl Send for Mapped {}
+unsafe impl Sync for Mapped {}
+
 impl Mapped {
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = File::open(path)?;

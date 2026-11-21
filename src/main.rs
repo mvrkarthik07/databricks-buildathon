@@ -28,6 +28,37 @@ fn hash(text: &[u8]) -> u64 {
 }
 
 #[derive(Default)]
+struct People<'a> {
+    table: HashTable<u32>,
+    names: Vec<Text<'a>>,
+}
+
+impl<'a> People<'a> {
+    fn find(&self, name: Text<'a>, hash: u64) -> Option<u32> {
+        self.table
+            .find(hash, |&id| self.names[id as usize] == name)
+            .copied()
+    }
+
+    fn intern(&mut self, name: Text<'a>, hash: u64) -> u32 {
+        let names = &mut self.names;
+        match self.table.entry(
+            hash,
+            |&id| names[id as usize] == name,
+            |&id| crate::hash(names[id as usize]),
+        ) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                let id = u32::try_from(names.len()).expect("too many distinct people");
+                names.push(name);
+                entry.insert(id);
+                id
+            }
+        }
+    }
+}
+
+#[derive(Default)]
 struct Ids<'a> {
     ids: FxHashMap<Text<'a>, u32>,
     names: Vec<Text<'a>>,
@@ -163,24 +194,6 @@ fn transpose<T>(sources: Vec<Vec<Vec<T>>>, shards: usize) -> Vec<Vec<Vec<T>>> {
 }
 
 #[derive(Clone, Copy)]
-struct EventCopy<'a> {
-    line: Text<'a>,
-    hash: u64,
-    id_end: usize,
-    ingest_start: usize,
-}
-
-impl<'a> EventCopy<'a> {
-    fn id(self) -> Text<'a> {
-        &self.line[usize::from(self.line[0] == b'"')..self.id_end]
-    }
-
-    fn ingest(self) -> Text<'a> {
-        &self.line[self.ingest_start..self.ingest_start + 20]
-    }
-}
-
-#[derive(Clone, Copy)]
 struct Event {
     ts: i64,
     person: u32,
@@ -188,8 +201,22 @@ struct Event {
     category: u32,
 }
 
+/// One parsed copy of an event row. Validity is settled per copy, but only the winning copy of
+/// each event ID (the earliest ingest) is allowed to count.
+struct Row<'a> {
+    hash: u64,
+    id: Text<'a>,
+    user: Text<'a>,
+    ts: i64,
+    price: u32,
+    category: u32,
+    ingest: [u8; 20],
+    valid: bool,
+}
+
 struct NamedEvent<'a> {
     name: Text<'a>,
+    hash: u64,
     event: Event,
 }
 
@@ -203,13 +230,24 @@ struct Click<'a> {
 
 struct NamedClick<'a> {
     name: Text<'a>,
+    hash: u64,
     click: Click<'a>,
 }
 
-fn route_copies(chunks: Vec<&[u8]>) -> Vec<Vec<EventCopy<'_>>> {
-    let mut shards = vec![Vec::new(); DEDUP_SHARDS];
+#[inline]
+fn worker_of(hash: u64, workers: usize) -> usize {
+    (((hash >> 32) * workers as u64) >> 32) as usize
+}
+
+fn route_rows<'a>(
+    chunks: Vec<&'a [u8]>,
+    catalog: &Catalog<'a>,
+    start: i64,
+    end: i64,
+) -> Vec<Vec<Row<'a>>> {
+    let mut shards: Vec<Vec<Row>> = (0..DEDUP_SHARDS).map(|_| Vec::new()).collect();
     for line in chunks.into_iter().flat_map(lines) {
-        let Some([id, _, _, ingest, _, _, _]) = fields(line) else {
+        let Some([id, user, ts, ingest, kind, product, price]) = fields(line) else {
             continue;
         };
         if id.is_empty() || ingest.len() != 20 {
@@ -218,83 +256,114 @@ fn route_copies(chunks: Vec<&[u8]>) -> Vec<Vec<EventCopy<'_>>> {
         let hash = hash(id);
         // Keep shard bits separate from hashbrown's low bucket bits and top seven tag bits.
         let shard = ((hash >> 52) as usize) % DEDUP_SHARDS;
-        shards[shard].push(EventCopy {
-            line,
+        let parsed = (|| {
+            if user.is_empty() || product.is_empty() {
+                return None;
+            }
+            let (price, category) = match kind {
+                b"view" | b"cart" => (0, 0),
+                b"purchase" => {
+                    let price = decimal(price, 10_000_000).filter(|&n| n != 0)?;
+                    let category = catalog
+                        .products
+                        .ids
+                        .get(product)
+                        .map_or(catalog.unknown, |&id| catalog.product_category[id as usize]);
+                    (price as u32, category)
+                }
+                _ => return None,
+            };
+            let ts = timestamp(ts)?;
+            if ts < start || ts >= end {
+                return None;
+            }
+            if timestamp(ingest)? - ts > DAY {
+                return None;
+            }
+            Some((ts, price, category))
+        })();
+        let (ts, price, category) = parsed.unwrap_or((0, 0, 0));
+        shards[shard].push(Row {
             hash,
-            id_end: id.as_ptr().addr() + id.len() - line.as_ptr().addr(),
-            ingest_start: ingest.as_ptr().addr() - line.as_ptr().addr(),
+            id,
+            user,
+            ts,
+            price,
+            category,
+            ingest: ingest.try_into().unwrap(),
+            valid: parsed.is_some(),
         });
     }
     shards
 }
 
+#[derive(Clone, Copy)]
+struct Slot {
+    hash: u64,
+    batch: u32,
+    pos: u32,
+}
+
 fn dedup_events<'a>(
-    batches: Vec<Vec<EventCopy<'a>>>,
+    batches: Vec<Vec<Row<'a>>>,
     people: &FxHashMap<Text<'a>, Text<'a>>,
-    catalog: &Catalog<'a>,
-    start: i64,
-    end: i64,
     workers: usize,
 ) -> Vec<Vec<NamedEvent<'a>>> {
-    let mut kept = HashTable::with_capacity(batches.iter().map(Vec::len).sum());
-    for event in batches.into_iter().flatten() {
-        match kept.entry(
-            event.hash,
-            |old: &EventCopy| old.id() == event.id(),
-            |row| row.hash,
-        ) {
-            Entry::Vacant(entry) => {
-                entry.insert(event);
+    let total: usize = batches.iter().map(Vec::len).sum();
+    let mut kept: HashTable<Slot> = HashTable::with_capacity(total);
+    for (b, batch) in batches.iter().enumerate() {
+        for (p, row) in batch.iter().enumerate() {
+            let slot = Slot {
+                hash: row.hash,
+                batch: b as u32,
+                pos: p as u32,
+            };
+            match kept.entry(
+                row.hash,
+                |old| {
+                    old.hash == row.hash
+                        && batches[old.batch as usize][old.pos as usize].id == row.id
+                },
+                |slot| slot.hash,
+            ) {
+                Entry::Vacant(entry) => {
+                    entry.insert(slot);
+                }
+                Entry::Occupied(mut entry) => {
+                    let old = &batches[entry.get().batch as usize][entry.get().pos as usize];
+                    if row.ingest < old.ingest {
+                        *entry.get_mut() = slot;
+                    }
+                }
             }
-            Entry::Occupied(mut entry) if event.ingest() < entry.get().ingest() => {
-                *entry.get_mut() = event;
-            }
-            Entry::Occupied(_) => {}
         }
     }
+    let mut winner: Vec<Vec<bool>> = batches.iter().map(|batch| vec![false; batch.len()]).collect();
+    for slot in &kept {
+        winner[slot.batch as usize][slot.pos as usize] = true;
+    }
+    drop(kept);
 
     let mut routed: Vec<Vec<NamedEvent>> = (0..workers).map(|_| Vec::new()).collect();
-    for copy in kept {
-        let [_, user, ts, _, kind, product, price] =
-            fields(copy.line).expect("dedup only receives parsed rows");
-        if user.is_empty() || product.is_empty() {
-            continue;
+    for (batch, winner) in batches.iter().zip(&winner) {
+        for (row, _) in batch.iter().zip(winner).filter(|&(row, &win)| win && row.valid) {
+            let name = if people.is_empty() {
+                row.user
+            } else {
+                people.get(row.user).copied().unwrap_or(row.user)
+            };
+            let hash = hash(name);
+            routed[worker_of(hash, workers)].push(NamedEvent {
+                name,
+                hash,
+                event: Event {
+                    ts: row.ts,
+                    price: row.price,
+                    category: row.category,
+                    person: 0,
+                },
+            });
         }
-        let (price, category) = match kind {
-            b"view" | b"cart" => (0, 0),
-            b"purchase" => {
-                let Some(price) = decimal(price, 10_000_000).filter(|&n| n != 0) else {
-                    continue;
-                };
-                let category = catalog
-                    .products
-                    .ids
-                    .get(product)
-                    .map_or(catalog.unknown, |&id| catalog.product_category[id as usize]);
-                (price as u32, category)
-            }
-            _ => continue,
-        };
-        let Some(ts) = timestamp(ts) else { continue };
-        if ts < start || ts >= end {
-            continue;
-        }
-        let Some(ingest) = timestamp(copy.ingest()) else {
-            continue;
-        };
-        if ingest - ts > DAY {
-            continue;
-        }
-        let name = people.get(user).copied().unwrap_or(user);
-        routed[hash(name) as usize % workers].push(NamedEvent {
-            name,
-            event: Event {
-                ts,
-                price,
-                category,
-                person: 0,
-            },
-        });
     }
     routed
 }
@@ -322,9 +391,15 @@ fn route_clicks<'a>(
         if ts < start - WEEK || ts >= end {
             continue;
         }
-        let name = people.get(user).copied().unwrap_or(user);
-        routed[hash(name) as usize % workers].push(NamedClick {
+        let name = if people.is_empty() {
+            user
+        } else {
+            people.get(user).copied().unwrap_or(user)
+        };
+        let hash = hash(name);
+        routed[worker_of(hash, workers)].push(NamedClick {
             name,
+            hash,
             click: Click {
                 ts,
                 id,
@@ -351,15 +426,25 @@ fn aggregate<'a>(
     click_batches: Vec<Vec<NamedClick<'a>>>,
     catalog: &Catalog<'a>,
 ) -> (Vec<UserRow<'a>>, CampaignDaily) {
-    let mut people = Ids::default();
+    let mut people = People::default();
     let mut events = Vec::with_capacity(event_batches.iter().map(Vec::len).sum());
-    for NamedEvent { name, mut event } in event_batches.into_iter().flatten() {
-        event.person = people.intern(name);
+    for NamedEvent {
+        name,
+        hash,
+        mut event,
+    } in event_batches.into_iter().flatten()
+    {
+        event.person = people.intern(name, hash);
         events.push(event);
     }
     let mut clicks = Vec::with_capacity(click_batches.iter().map(Vec::len).sum());
-    for NamedClick { name, mut click } in click_batches.into_iter().flatten() {
-        if let Some(&person) = people.ids.get(name) {
+    for NamedClick {
+        name,
+        hash,
+        mut click,
+    } in click_batches.into_iter().flatten()
+    {
+        if let Some(person) = people.find(name, hash) {
             click.person = person;
             clicks.push(click);
         }
@@ -467,6 +552,13 @@ fn flush_daily<'a>(
 }
 
 fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
+    let t = std::time::Instant::now();
+    let timing = env::var_os("SS_TIMING").is_some();
+    let lap = |name: &str| {
+        if timing {
+            eprintln!("{name}: {:?}", t.elapsed());
+        }
+    };
     let manifest = Mapped::open(&data.join("manifest.json"))?;
     let manifest: serde_json::Value = serde_json::from_slice(manifest.bytes())?;
     let parse_boundary = |key: &str| {
@@ -486,18 +578,26 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
     let products = Mapped::open(&data.join("products.csv"))?;
     let campaigns = Mapped::open(&data.join("campaigns.csv"))?;
     let catalog = catalog(&products, &campaigns);
+    lap("catalog");
     let links = csv_files(&data.join("links"))?;
-    let people = link_names(&links);
     let event_files = csv_files(&data.join("events"))?;
     let click_files = csv_files(&data.join("clicks"))?;
-
-    let copies = parallel(chunk_batches(&event_files, workers), workers, route_copies);
-    let events = parallel(transpose(copies, DEDUP_SHARDS), workers, |batches| {
-        dedup_events(batches, &people, &catalog, start, end, workers)
+    let (people, copies) = thread::scope(|scope| {
+        let people = scope.spawn(|| link_names(&links));
+        let copies = parallel(chunk_batches(&event_files, workers), workers, |chunks| {
+            route_rows(chunks, &catalog, start, end)
+        });
+        (people.join().unwrap(), copies)
     });
+    lap("links+route");
+    let events = parallel(transpose(copies, DEDUP_SHARDS), workers, |batches| {
+        dedup_events(batches, &people, workers)
+    });
+    lap("dedup");
     let clicks = parallel(chunk_batches(&click_files, workers), workers, |chunks| {
         route_clicks(chunks, &people, &catalog, start, end, workers)
     });
+    lap("clicks");
 
     let user_folder = out.join("user_daily");
     let campaign_folder = out.join("campaign_daily");
@@ -520,6 +620,7 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
         },
     );
 
+    lap("aggregate+users");
     let mut merged = CampaignDaily::default();
     for result in results {
         for (key, part) in result? {
@@ -540,6 +641,7 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
         })
         .collect();
     output::campaigns(&campaign_folder.join("part-0.parquet"), &rows)?;
+    lap("campaigns");
     Ok(())
 }
 
