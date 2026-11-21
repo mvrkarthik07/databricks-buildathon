@@ -121,7 +121,7 @@ fn root(parents: &mut [u32], mut id: u32) -> usize {
     id as usize
 }
 
-fn link_names(links: &[Mapped]) -> FxHashMap<Text<'_>, Text<'_>> {
+fn link_names(links: &[Mapped]) -> Links<'_> {
     let mut users = Ids::default();
     let mut parents = Vec::new();
     let mut sizes = Vec::new();
@@ -152,12 +152,49 @@ fn link_names(links: &[Mapped]) -> FxHashMap<Text<'_>, Text<'_>> {
         let component = root(&mut parents, id as u32);
         smallest[component] = min(smallest[component], name);
     }
-    users
+    let entries: Vec<(Text, Text)> = users
         .names
         .into_iter()
         .enumerate()
         .map(|(id, name)| (name, smallest[root(&mut parents, id as u32)]))
-        .collect()
+        .collect();
+    Links::new(entries)
+}
+
+/// Maps a linked ID to the person's smallest ID. A one-hash bloom filter answers the common
+/// "not linked" case without touching the table.
+struct Links<'a> {
+    table: HashTable<(Text<'a>, Text<'a>)>,
+    bloom: Vec<u64>,
+    shift: u32,
+}
+
+impl<'a> Links<'a> {
+    fn new(entries: Vec<(Text<'a>, Text<'a>)>) -> Self {
+        let bits = (entries.len().max(1) * 32).next_power_of_two().max(64);
+        let shift = 64 - bits.trailing_zeros();
+        let mut links = Links {
+            table: HashTable::with_capacity(entries.len()),
+            bloom: vec![0; bits / 64],
+            shift,
+        };
+        for entry in entries {
+            let h = hash(entry.0);
+            let bit = (h >> shift) as usize;
+            links.bloom[bit / 64] |= 1 << (bit % 64);
+            links.table.insert_unique(h, entry, |e| hash(e.0));
+        }
+        links
+    }
+
+    #[inline]
+    fn resolve(&self, user: Text<'a>, h: u64) -> Option<Text<'a>> {
+        let bit = (h >> self.shift) as usize;
+        if self.bloom[bit / 64] >> (bit % 64) & 1 == 0 {
+            return None;
+        }
+        self.table.find(h, |e| e.0 == user).map(|e| e.1)
+    }
 }
 
 fn parallel<T: Send, U: Send>(jobs: Vec<T>, workers: usize, run: impl Fn(T) -> U + Sync) -> Vec<U> {
@@ -206,6 +243,7 @@ struct Row<'a> {
     hash: u64,
     id: Text<'a>,
     user: Text<'a>,
+    user_hash: u64,
     ts: i64,
     price: u32,
     category: u32,
@@ -283,6 +321,7 @@ fn route_rows<'a>(
             hash,
             id,
             user,
+            user_hash: crate::hash(user),
             ts,
             price,
             category,
@@ -303,7 +342,7 @@ struct Slot {
 
 fn dedup_events<'a>(
     batches: Vec<Vec<Row<'a>>>,
-    people: &FxHashMap<Text<'a>, Text<'a>>,
+    people: &Links<'a>,
     workers: usize,
 ) -> Vec<Vec<NamedEvent<'a>>> {
     let total: usize = batches.iter().map(Vec::len).sum();
@@ -341,15 +380,14 @@ fn dedup_events<'a>(
     }
     drop(kept);
 
-    let mut routed: Vec<Vec<NamedEvent>> = (0..workers).map(|_| Vec::new()).collect();
+    let share = total / workers + total / workers / 8 + 16;
+    let mut routed: Vec<Vec<NamedEvent>> = (0..workers).map(|_| Vec::with_capacity(share)).collect();
     for (batch, winner) in batches.iter().zip(&winner) {
         for (row, _) in batch.iter().zip(winner).filter(|&(row, &win)| win && row.valid) {
-            let name = if people.is_empty() {
-                row.user
-            } else {
-                people.get(row.user).copied().unwrap_or(row.user)
+            let (name, hash) = match people.resolve(row.user, row.user_hash) {
+                Some(name) => (name, hash(name)),
+                None => (row.user, row.user_hash),
             };
-            let hash = hash(name);
             routed[worker_of(hash, workers)].push(NamedEvent {
                 name,
                 hash,
@@ -366,7 +404,7 @@ fn dedup_events<'a>(
 
 fn route_clicks<'a>(
     chunks: Vec<Text<'a>>,
-    people: &FxHashMap<Text<'a>, Text<'a>>,
+    people: &Links<'a>,
     catalog: &Catalog<'a>,
     start: i64,
     end: i64,
@@ -388,12 +426,11 @@ fn route_clicks<'a>(
         if ts < start - WEEK || ts >= end {
             return;
         }
-        let name = if people.is_empty() {
-            user
-        } else {
-            people.get(user).copied().unwrap_or(user)
+        let user_hash = crate::hash(user);
+        let (name, hash) = match people.resolve(user, user_hash) {
+            Some(name) => (name, crate::hash(name)),
+            None => (user, user_hash),
         };
-        let hash = hash(name);
         routed[worker_of(hash, workers)].push(NamedClick {
             name,
             hash,
