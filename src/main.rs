@@ -13,7 +13,10 @@ use hashbrown::HashTable;
 use hashbrown::hash_table::Entry;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHasher};
 
-use input::{DAY, GAP, Mapped, WEEK, chunk_batches, csv_files, decimal, fields, lines, rows, timestamp};
+use input::{
+    DAY, Dates, GAP, Mapped, WEEK, chunk_batches, csv_files, decimal, fields, lines, rows, timestamp,
+    timestamp_cached,
+};
 use output::{CampaignRow, UserRow};
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
@@ -335,6 +338,7 @@ fn route_rows<'a>(
     let lines: usize = chunks.iter().map(|chunk| memchr::memchr_iter(b'\n', chunk).count()).sum();
     let share = lines / DEDUP_SHARDS + lines / DEDUP_SHARDS / 16 + 64;
     let mut shards: Vec<Vec<Row>> = (0..DEDUP_SHARDS).map(|_| Vec::with_capacity(share)).collect();
+    let mut dates = Dates::new();
     for chunk in chunks {
         rows::<7>(chunk, |[id, user, ts, ingest, kind, product, price]| {
         if id.is_empty() || ingest.len() != 20 {
@@ -360,11 +364,11 @@ fn route_rows<'a>(
                 }
                 _ => return None,
             };
-            let ts = timestamp(ts)?;
+            let ts = timestamp_cached(ts, &mut dates)?;
             if ts < start || ts >= end {
                 return None;
             }
-            if timestamp(ingest)? - ts > DAY {
+            if timestamp_cached(ingest, &mut dates)? - ts > DAY {
                 return None;
             }
             Some((ts, price, category))
@@ -466,6 +470,7 @@ fn route_clicks<'a>(
     workers: usize,
 ) -> Vec<Vec<NamedClick<'a>>> {
     let mut routed: Vec<Vec<NamedClick>> = (0..workers).map(|_| Vec::new()).collect();
+    let mut dates = Dates::new();
     for chunk in chunks {
         rows::<4>(chunk, |[id, user, campaign, ts]| {
         if id.is_empty() || user.is_empty() {
@@ -477,7 +482,7 @@ fn route_clicks<'a>(
         if campaign == catalog.organic {
             return;
         }
-        let Some(ts) = timestamp(ts) else { return };
+        let Some(ts) = timestamp_cached(ts, &mut dates) else { return };
         if ts < start - WEEK || ts >= end {
             return;
         }

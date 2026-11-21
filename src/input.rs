@@ -239,6 +239,17 @@ pub fn decimal(raw: &[u8], max: u64) -> Option<u64> {
     if raw.is_empty() {
         return None;
     }
+    if raw.len() <= 18 {
+        // Eighteen digits cannot overflow u64, so one check at the end is enough.
+        let mut value = 0u64;
+        let mut bad = 0u8;
+        for &byte in raw {
+            let digit = byte.wrapping_sub(b'0');
+            bad |= u8::from(digit > 9);
+            value = value * 10 + u64::from(digit);
+        }
+        return (bad == 0 && value <= max).then_some(value);
+    }
     let mut value = 0u64;
     for &byte in raw {
         let digit = byte.wrapping_sub(b'0');
@@ -248,6 +259,97 @@ pub fn decimal(raw: &[u8], max: u64) -> Option<u64> {
         value = value * 10 + u64::from(digit);
     }
     (value <= max).then_some(value)
+}
+
+/// Remembers the epoch milliseconds of recently seen `YYYY-MM-DD` prefixes, so the calendar
+/// checks and day arithmetic run once per distinct date instead of once per timestamp.
+pub struct Dates {
+    slots: Vec<(u64, u16, i64)>,
+}
+
+impl Dates {
+    pub fn new() -> Self {
+        Self {
+            slots: vec![(0, 0, i64::MIN); 256],
+        }
+    }
+}
+
+const BAD_DATE: i64 = i64::MIN + 1;
+
+#[inline]
+fn date_start(raw: &[u8; 10]) -> i64 {
+    let [a, b, c, d, b'-', e, f, b'-', g, h] = *raw else {
+        return BAD_DATE;
+    };
+    let (Some(hi), Some(lo), Some(month), Some(day)) =
+        (two(a, b), two(c, d), two(e, f), two(g, h))
+    else {
+        return BAD_DATE;
+    };
+    let year = hi * 100 + lo;
+    if year == 0 || !(1..=12).contains(&month) {
+        return BAD_DATE;
+    }
+    let max_day = match month {
+        2 => 28 + i64::from(year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)),
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if day == 0 || day > max_day {
+        return BAD_DATE;
+    }
+    days_from_civil(year, month, day) * DAY
+}
+
+/// Same result as `timestamp`, using `dates` to skip repeated calendar work.
+#[inline]
+pub fn timestamp_cached(raw: &[u8], dates: &mut Dates) -> Option<i64> {
+    if raw.len() >= 20 && raw[10] == b'T' {
+        let prefix: &[u8; 10] = raw[..10].try_into().unwrap();
+        let lead = u64::from_le_bytes(prefix[..8].try_into().unwrap());
+        let tail = u16::from_le_bytes([prefix[8], prefix[9]]);
+        let slot = ((lead ^ u64::from(tail).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            >> 56) as usize;
+        let entry = &mut dates.slots[slot];
+        let day = if entry.0 == lead && entry.1 == tail && entry.2 != i64::MIN {
+            entry.2
+        } else {
+            let day = date_start(prefix);
+            *entry = (lead, tail, day);
+            day
+        };
+        if day == BAD_DATE {
+            return None;
+        }
+        return time_of_day(&raw[11..], day);
+    }
+    timestamp(raw)
+}
+
+#[inline]
+fn time_of_day(rest: &[u8], day: i64) -> Option<i64> {
+    let [i, j, b':', k, l, b':', m, n, zone @ ..] = rest else {
+        return None;
+    };
+    let (hour, minute, second) = (two(*i, *j)?, two(*k, *l)?, two(*m, *n)?);
+    if hour >= 24 || minute >= 60 || second >= 60 {
+        return None;
+    }
+    let offset = match zone {
+        [b'Z'] => 0,
+        [sign @ (b'+' | b'-'), a, b, b':', c, d] => {
+            let (hours, minutes) = (two(*a, *b)?, two(*c, *d)?);
+            if hours >= 24 || minutes >= 60 {
+                return None;
+            }
+            let offset = hours * 60 + minutes;
+            if *sign == b'+' { offset } else { -offset }
+        }
+        _ => return None,
+    };
+    Some(day + ((hour * 60 + minute - offset) * 60 + second) * 1000)
 }
 
 /// Calls `f` with the N cleaned fields of every well-formed line, exactly as `fields::<N>` does
