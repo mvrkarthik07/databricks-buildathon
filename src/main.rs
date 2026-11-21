@@ -281,7 +281,9 @@ fn route_rows<'a>(
     start: i64,
     end: i64,
 ) -> Vec<Vec<Row<'a>>> {
-    let mut shards: Vec<Vec<Row>> = (0..DEDUP_SHARDS).map(|_| Vec::new()).collect();
+    let lines: usize = chunks.iter().map(|chunk| memchr::memchr_iter(b'\n', chunk).count()).sum();
+    let share = lines / DEDUP_SHARDS + lines / DEDUP_SHARDS / 16 + 64;
+    let mut shards: Vec<Vec<Row>> = (0..DEDUP_SHARDS).map(|_| Vec::with_capacity(share)).collect();
     for chunk in chunks {
         rows::<7>(chunk, |[id, user, ts, ingest, kind, product, price]| {
         if id.is_empty() || ingest.len() != 20 {

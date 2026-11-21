@@ -251,9 +251,19 @@ pub fn decimal(raw: &[u8], max: u64) -> Option<u64> {
 }
 
 /// Calls `f` with the N cleaned fields of every well-formed line, exactly as `fields::<N>` does
-/// per `lines` item, but with a single vectorised scan for both separators.
+/// per `lines` item, but with a single scan for all separators.
 #[inline]
-pub fn rows<'a, const N: usize>(bytes: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
+pub fn rows<'a, const N: usize>(bytes: &'a [u8], f: impl FnMut([&'a [u8]; N])) {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("popcnt") {
+        // SAFETY: the CPU supports AVX2, checked just above.
+        return unsafe { rows_avx2(bytes, f) };
+    }
+    rows_scalar(bytes, f);
+}
+
+#[inline]
+fn rows_scalar<'a, const N: usize>(bytes: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
     let mut ends = [0usize; N];
     let mut count = 0usize;
     let mut line_start = 0usize;
@@ -266,7 +276,8 @@ pub fn rows<'a, const N: usize>(bytes: &'a [u8], mut f: impl FnMut([&'a [u8]; N]
         } else {
             if count == N - 1 {
                 ends[N - 1] = p;
-                emit(bytes, line_start, &ends, &mut f);
+                let quoted = memchr(b'"', &bytes[line_start..p]).is_some();
+                emit(bytes, line_start, &ends, quoted, &mut f);
             }
             count = 0;
             line_start = p + 1;
@@ -274,7 +285,97 @@ pub fn rows<'a, const N: usize>(bytes: &'a [u8], mut f: impl FnMut([&'a [u8]; N]
     }
     if count == N - 1 && line_start <= bytes.len() {
         ends[N - 1] = bytes.len();
-        emit(bytes, line_start, &ends, &mut f);
+        let quoted = memchr(b'"', &bytes[line_start..]).is_some();
+        emit(bytes, line_start, &ends, quoted, &mut f);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,popcnt")]
+unsafe fn rows_avx2<'a, const N: usize>(bytes: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
+    use std::arch::x86_64::*;
+    let mut ends = [0usize; N];
+    let mut count = 0usize;
+    let mut line_start = 0usize;
+    let mut quote_count = 0u32;
+    let comma = _mm256_set1_epi8(b',' as i8);
+    let newline = _mm256_set1_epi8(b'\n' as i8);
+    let quote = _mm256_set1_epi8(b'"' as i8);
+    let mut tail;
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let block = if offset + 32 <= bytes.len() {
+            unsafe { _mm256_loadu_si256(bytes.as_ptr().add(offset).cast()) }
+        } else {
+            tail = [0u8; 32];
+            tail[..bytes.len() - offset].copy_from_slice(&bytes[offset..]);
+            unsafe { _mm256_loadu_si256(tail.as_ptr().cast()) }
+        };
+        let commas = _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, comma)) as u32;
+        let newlines = _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, newline)) as u32;
+        let mut quotes = _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, quote)) as u32;
+        let mut delims = commas | newlines;
+        while delims != 0 {
+            let i = delims.trailing_zeros();
+            let bit = 1u32 << i;
+            let p = offset + i as usize;
+            delims &= delims - 1;
+            if newlines & bit == 0 {
+                if count < N - 1 {
+                    ends[count] = p;
+                }
+                count += 1;
+            } else {
+                if count == N - 1 {
+                    ends[N - 1] = p;
+                    let line_quotes = quote_count + (quotes & (bit - 1)).count_ones();
+                    emit_counted(bytes, line_start, &ends, line_quotes, &mut f);
+                }
+                count = 0;
+                line_start = p + 1;
+                quote_count = 0;
+                // Quotes up to and including this newline belong to the finished line.
+                quotes &= !(bit | (bit - 1));
+            }
+        }
+        quote_count += quotes.count_ones();
+        offset += 32;
+    }
+    if count == N - 1 {
+        ends[N - 1] = bytes.len();
+        emit_counted(bytes, line_start, &ends, quote_count, &mut f);
+    }
+}
+
+/// Like `emit`, but the caller already counted the quotes in the line. The line is well formed
+/// exactly when every quote is the first or last byte of a field that has both.
+#[inline(always)]
+fn emit_counted<'a, const N: usize>(
+    bytes: &'a [u8],
+    line_start: usize,
+    ends: &[usize; N],
+    quotes: u32,
+    f: &mut impl FnMut([&'a [u8]; N]),
+) {
+    let mut out = [&[][..]; N];
+    let mut start = line_start;
+    let mut wrapped = 0u32;
+    for k in 0..N {
+        let value = &bytes[start..ends[k]];
+        start = ends[k] + 1;
+        out[k] = if quotes != 0 {
+            if let [b'"', inner @ .., b'"'] = value {
+                wrapped += 1;
+                inner
+            } else {
+                value
+            }
+        } else {
+            value
+        };
+    }
+    if quotes == 2 * wrapped {
+        f(out);
     }
 }
 
@@ -283,10 +384,9 @@ fn emit<'a, const N: usize>(
     bytes: &'a [u8],
     line_start: usize,
     ends: &[usize; N],
+    quoted: bool,
     f: &mut impl FnMut([&'a [u8]; N]),
 ) {
-    let line = &bytes[line_start..ends[N - 1]];
-    let quoted = memchr(b'"', line).is_some();
     let mut out = [&[][..]; N];
     let mut start = line_start;
     for k in 0..N {
