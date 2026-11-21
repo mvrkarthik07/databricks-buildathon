@@ -505,3 +505,17 @@ fn emit<'a, const N: usize>(
     }
     f(out);
 }
+
+/// Hints that a chunk of a mapped file will be read soon, so a cold page cache starts reading
+/// ahead instead of faulting page by page. Best effort: a failed hint changes nothing.
+#[inline]
+pub fn will_need(chunk: &[u8]) {
+    const PAGE: usize = 4096;
+    let start = chunk.as_ptr().addr();
+    let first = (start + PAGE - 1) & !(PAGE - 1);
+    let last = (start + chunk.len()) & !(PAGE - 1);
+    if last > first {
+        // SAFETY: MADV_WILLNEED only advises; it never changes or unmaps memory.
+        unsafe { libc::madvise(first as *mut libc::c_void, last - first, libc::MADV_WILLNEED) };
+    }
+}

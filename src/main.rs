@@ -15,7 +15,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHasher};
 
 use input::{
     DAY, Dates, GAP, Mapped, WEEK, chunk_batches, csv_files, decimal, fields, lines, rows, timestamp,
-    timestamp_cached,
+    timestamp_cached, will_need,
 };
 use output::{CampaignRow, UserRow};
 
@@ -398,7 +398,13 @@ fn route_rows<'a>(
     let share = lines / DEDUP_SHARDS + lines / DEDUP_SHARDS / 16 + 64;
     let mut shards: Vec<Vec<Row>> = (0..DEDUP_SHARDS).map(|_| Vec::with_capacity(share)).collect();
     let mut dates = Dates::new();
-    for chunk in chunks {
+    for chunk in chunks.iter().take(2) {
+        will_need(chunk);
+    }
+    for (index, &chunk) in chunks.iter().enumerate() {
+        if let Some(ahead) = chunks.get(index + 2) {
+            will_need(ahead);
+        }
         rows::<7>(chunk, |[id, user, ts, ingest, kind, product, price]| {
         if id.is_empty() || ingest.len() != 20 {
             return;
@@ -530,7 +536,13 @@ fn route_clicks<'a>(
 ) -> Vec<Vec<NamedClick<'a>>> {
     let mut routed: Vec<Vec<NamedClick>> = (0..workers).map(|_| Vec::new()).collect();
     let mut dates = Dates::new();
-    for chunk in chunks {
+    for chunk in chunks.iter().take(2) {
+        will_need(chunk);
+    }
+    for (index, &chunk) in chunks.iter().enumerate() {
+        if let Some(ahead) = chunks.get(index + 2) {
+            will_need(ahead);
+        }
         rows::<4>(chunk, |[id, user, campaign, ts]| {
         if id.is_empty() || user.is_empty() {
             return;
@@ -858,5 +870,7 @@ fn main() -> Result<()> {
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(8)
         .clamp(1, 8);
-    run(&data, &output, workers)
+    run(&data, &output, workers)?;
+    // Everything is written and closed; skip tearing down gigabytes of buffers.
+    std::process::exit(0);
 }
