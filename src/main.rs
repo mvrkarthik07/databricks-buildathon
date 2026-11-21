@@ -21,7 +21,21 @@ use output::{CampaignRow, UserRow};
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 type Text<'a> = &'a [u8];
-const DEDUP_SHARDS: usize = 64;
+/// Experiment knob: `SS_SHARDS` overrides the dedup shard count (default 64).
+fn dedup_shards() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| env::var("SS_SHARDS").ok().and_then(|s| s.parse().ok()).unwrap_or(64))
+}
+
+/// Sums of per-thread stage times, printed with `SS_TIMING`.
+static STAGE: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+const STAGE_NAMES: [&str; 8] = [
+    "dedup insert", "dedup winners", "dedup resolve+route", "agg intern+find", "agg group", "agg sort+session", "parquet users", "tail drop",
+];
+fn stage(i: usize, since: std::time::Instant) -> std::time::Instant {
+    STAGE[i].fetch_add(since.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    std::time::Instant::now()
+}
 
 /// A second hash, independent of `hash`, built from folded 128-bit multiplies.
 fn hash2(text: &[u8]) -> u64 {
@@ -485,8 +499,9 @@ fn route_rows<'a>(
     end: i64,
 ) -> Vec<Vec<Row>> {
     let lines: usize = chunks.iter().map(|(_, chunk)| memchr::memchr_iter(b'\n', chunk).count()).sum();
-    let share = lines / DEDUP_SHARDS + lines / DEDUP_SHARDS / 16 + 64;
-    let mut shards: Vec<Vec<Row>> = (0..DEDUP_SHARDS).map(|_| Vec::with_capacity(share)).collect();
+    let shard_count = dedup_shards();
+    let share = lines / shard_count + lines / shard_count / 16 + 64;
+    let mut shards: Vec<Vec<Row>> = (0..shard_count).map(|_| Vec::with_capacity(share)).collect();
     let mut dates = Dates::new();
     for (_, chunk) in chunks.iter().take(2) {
         will_need(chunk);
@@ -505,7 +520,7 @@ fn route_rows<'a>(
         let hash = hash(id);
         // Keep shard bits separate from hashbrown's low bucket bits (below 2^32 buckets) and its
         // top seven tag bits.
-        let shard = ((hash >> 40) as usize) % DEDUP_SHARDS;
+        let shard = ((hash >> 40) as usize) % shard_count;
         let parsed = (|| {
             if user.is_empty() || product.is_empty() {
                 return None;
@@ -561,6 +576,7 @@ fn dedup_events<'a>(
     chunks: &[Text<'a>],
     workers: usize,
 ) -> Vec<Vec<NamedEvent>> {
+    let mut t = std::time::Instant::now();
     let total: usize = batches.iter().map(Vec::len).sum();
     let mut kept: HashTable<Slot> = HashTable::with_capacity(total);
     for (b, batch) in batches.iter().enumerate() {
@@ -591,12 +607,14 @@ fn dedup_events<'a>(
             }
         }
     }
+    t = stage(0, t);
     let mut winner: Vec<Vec<bool>> = batches.iter().map(|batch| vec![false; batch.len()]).collect();
     for slot in &kept {
         winner[slot.batch as usize][slot.pos as usize] = true;
     }
     drop(kept);
 
+    t = stage(1, t);
     let share = total / workers + total / workers / 8 + 16;
     let mut routed: Vec<Vec<NamedEvent>> = (0..workers).map(|_| Vec::with_capacity(share)).collect();
     for (batch, winner) in batches.iter().zip(&winner) {
@@ -617,6 +635,7 @@ fn dedup_events<'a>(
             });
         }
     }
+    stage(2, t);
     routed
 }
 
@@ -823,6 +842,7 @@ fn aggregate<'a>(
     chunks: &[Text<'a>],
     links: &Links<'a>,
 ) -> (Vec<UserRow<'a>>, DailyTotals) {
+    let mut t = std::time::Instant::now();
     let mut people = People::default();
     let event_count: usize = event_batches.iter().map(Vec::len).sum();
     let mut event_person = Vec::with_capacity(event_count);
@@ -833,6 +853,7 @@ fn aggregate<'a>(
     for click in click_batches.iter().flatten() {
         click_person.push(people.find(click.hash, click.hash2));
     }
+    t = stage(3, t);
     let person_count = people.names.len();
     let (mut events, event_start) = group_by_person(
         event_batches
@@ -854,6 +875,7 @@ fn aggregate<'a>(
         person_count,
     );
     drop((event_batches, click_batches, event_person, click_person));
+    t = stage(4, t);
 
     let mut users = Vec::new();
     let campaign_count = catalog.campaigns.names.len();
@@ -935,6 +957,7 @@ fn aggregate<'a>(
         flush_daily(&mut users, daily, &mut touched, &mut spend, catalog);
     }
 
+    stage(5, t);
     (users, campaigns)
 }
 
@@ -1016,7 +1039,7 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
         (people.join().unwrap(), copies)
     });
     lap("links+route");
-    let events = parallel(transpose(copies, DEDUP_SHARDS), workers, |batches| {
+    let events = parallel(transpose(copies, dedup_shards()), workers, |batches| {
         dedup_events(batches, &people, &event_chunks, workers)
     });
     lap("dedup");
@@ -1042,7 +1065,9 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
         |(shard, (events, clicks))| -> Result<DailyTotals> {
             let (users, campaigns) = aggregate(events, clicks, &catalog, days, &event_chunks, &people);
             if shard == 0 || !users.is_empty() {
+                let t = std::time::Instant::now();
                 output::users(&user_folder.join(format!("part-{shard}.parquet")), &users)?;
+                stage(6, t);
             }
             Ok(campaigns)
         },
@@ -1070,6 +1095,11 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
         .collect();
     output::campaigns(&campaign_folder.join("part-0.parquet"), &rows)?;
     lap("campaigns");
+    if timing {
+        for (name, ns) in STAGE_NAMES.iter().zip(&STAGE) {
+            eprintln!("  {name}: {:.0} thread-ms", ns.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6);
+        }
+    }
     Ok(())
 }
 
