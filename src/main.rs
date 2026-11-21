@@ -20,6 +20,47 @@ type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 type Text<'a> = &'a [u8];
 const DEDUP_SHARDS: usize = 32;
 
+/// A second hash, independent of `hash`, built from folded 128-bit multiplies.
+fn hash2(text: &[u8]) -> u64 {
+    const S0: u64 = 0xa076_1d64_78bd_642f;
+    const S1: u64 = 0xe703_7ed1_a0b4_28db;
+    const S2: u64 = 0x8ebc_6af0_9c88_c6e3;
+    #[inline]
+    fn mix(a: u64, b: u64) -> u64 {
+        let product = u128::from(a) * u128::from(b);
+        (product as u64) ^ ((product >> 64) as u64)
+    }
+    #[inline]
+    fn word(bytes: &[u8]) -> u64 {
+        u64::from_le_bytes(bytes[..8].try_into().unwrap())
+    }
+    #[inline]
+    fn half(bytes: &[u8]) -> u64 {
+        u64::from(u32::from_le_bytes(bytes[..4].try_into().unwrap()))
+    }
+    let len = text.len() as u64;
+    let mut seed = S0 ^ len;
+    let mut rest = text;
+    while rest.len() > 16 {
+        seed = mix(word(rest) ^ S1, word(&rest[8..]) ^ seed);
+        rest = &rest[16..];
+    }
+    let (a, b) = if rest.len() >= 8 {
+        (word(rest), word(&rest[rest.len() - 8..]))
+    } else if rest.len() >= 4 {
+        (half(rest), half(&rest[rest.len() - 4..]))
+    } else if !rest.is_empty() {
+        let n = rest.len();
+        (
+            u64::from(rest[0]) << 16 | u64::from(rest[n / 2]) << 8 | u64::from(rest[n - 1]),
+            0,
+        )
+    } else {
+        (0, 0)
+    };
+    mix(S1 ^ len, mix(a ^ S2, b ^ seed))
+}
+
 fn hash(text: &[u8]) -> u64 {
     use std::hash::Hasher;
     let mut hasher = FxHasher::default();
@@ -27,30 +68,37 @@ fn hash(text: &[u8]) -> u64 {
     hasher.finish()
 }
 
+/// Distinct people, identified by two independent 64-bit hashes of their smallest ID. Equal
+/// pairs are treated as equal names: a false match needs a 128-bit collision, so the name bytes
+/// (which sit cold in the input mapping) are never read back to confirm.
 #[derive(Default)]
 struct People<'a> {
     table: HashTable<u32>,
+    keys: Vec<(u64, u64)>,
     names: Vec<Text<'a>>,
 }
 
 impl<'a> People<'a> {
-    fn find(&self, name: Text<'a>, hash: u64) -> Option<u32> {
+    #[inline]
+    fn find(&self, hash: u64, hash2: u64) -> Option<u32> {
         self.table
-            .find(hash, |&id| self.names[id as usize] == name)
+            .find(hash, |&id| self.keys[id as usize] == (hash, hash2))
             .copied()
     }
 
-    fn intern(&mut self, name: Text<'a>, hash: u64) -> u32 {
-        let names = &mut self.names;
+    #[inline]
+    fn intern(&mut self, name: Text<'a>, hash: u64, hash2: u64) -> u32 {
+        let keys = &mut self.keys;
         match self.table.entry(
             hash,
-            |&id| names[id as usize] == name,
-            |&id| crate::hash(names[id as usize]),
+            |&id| keys[id as usize] == (hash, hash2),
+            |&id| keys[id as usize].0,
         ) {
             Entry::Occupied(entry) => *entry.get(),
             Entry::Vacant(entry) => {
-                let id = u32::try_from(names.len()).expect("too many distinct people");
-                names.push(name);
+                let id = u32::try_from(keys.len()).expect("too many distinct people");
+                keys.push((hash, hash2));
+                self.names.push(name);
                 entry.insert(id);
                 id
             }
@@ -244,6 +292,7 @@ struct Row<'a> {
     id: Text<'a>,
     user: Text<'a>,
     user_hash: u64,
+    user_hash2: u64,
     ts: i64,
     price: u32,
     category: u32,
@@ -254,6 +303,7 @@ struct Row<'a> {
 struct NamedEvent<'a> {
     name: Text<'a>,
     hash: u64,
+    hash2: u64,
     event: Event,
 }
 
@@ -267,6 +317,7 @@ struct Click<'a> {
 struct NamedClick<'a> {
     name: Text<'a>,
     hash: u64,
+    hash2: u64,
     click: Click<'a>,
 }
 
@@ -324,6 +375,7 @@ fn route_rows<'a>(
             id,
             user,
             user_hash: crate::hash(user),
+            user_hash2: hash2(user),
             ts,
             price,
             category,
@@ -386,13 +438,14 @@ fn dedup_events<'a>(
     let mut routed: Vec<Vec<NamedEvent>> = (0..workers).map(|_| Vec::with_capacity(share)).collect();
     for (batch, winner) in batches.iter().zip(&winner) {
         for (row, _) in batch.iter().zip(winner).filter(|&(row, &win)| win && row.valid) {
-            let (name, hash) = match people.resolve(row.user, row.user_hash) {
-                Some(name) => (name, hash(name)),
-                None => (row.user, row.user_hash),
+            let (name, hash, hash2) = match people.resolve(row.user, row.user_hash) {
+                Some(name) => (name, crate::hash(name), self::hash2(name)),
+                None => (row.user, row.user_hash, row.user_hash2),
             };
             routed[worker_of(hash, workers)].push(NamedEvent {
                 name,
                 hash,
+                hash2,
                 event: Event {
                     ts: row.ts,
                     price: row.price,
@@ -429,13 +482,14 @@ fn route_clicks<'a>(
             return;
         }
         let user_hash = crate::hash(user);
-        let (name, hash) = match people.resolve(user, user_hash) {
-            Some(name) => (name, crate::hash(name)),
-            None => (user, user_hash),
+        let (name, hash, hash2) = match people.resolve(user, user_hash) {
+            Some(name) => (name, crate::hash(name), self::hash2(name)),
+            None => (user, user_hash, self::hash2(user)),
         };
         routed[worker_of(hash, workers)].push(NamedClick {
             name,
             hash,
+            hash2,
             click: Click {
                 ts,
                 id,
@@ -490,11 +544,11 @@ fn aggregate<'a>(
     let event_count: usize = event_batches.iter().map(Vec::len).sum();
     let mut event_person = Vec::with_capacity(event_count);
     for event in event_batches.iter().flatten() {
-        event_person.push(people.intern(event.name, event.hash));
+        event_person.push(people.intern(event.name, event.hash, event.hash2));
     }
     let mut click_person = Vec::with_capacity(click_batches.iter().map(Vec::len).sum());
     for click in click_batches.iter().flatten() {
-        click_person.push(people.find(click.name, click.hash));
+        click_person.push(people.find(click.hash, click.hash2));
     }
     let person_count = people.names.len();
     let (mut events, event_start) = group_by_person(
