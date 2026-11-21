@@ -85,3 +85,11 @@ jobs:
           for n in 1 8 64 512 4096; do
             echo "== SS_SHARDS=$n"; SS_SHARDS=$n SS_BENCH=1 /tmp/new /tmp/data /tmp/o 2>&1 | grep -E "full route_rows|split \(rows:"
           done
+      - name: Sampled profile of the whole pipeline (perf, cpu-clock, symbols)
+        if: ${{ inputs.only_micro == 'true' }}
+        run: |
+          sudo apt-get install -y -q linux-tools-common linux-tools-$(uname -r) > /dev/null 2>&1 || sudo apt-get install -y -q linux-tools-generic > /dev/null 2>&1 || true
+          sudo sysctl -q kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 || true
+          PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1); PERF=${PERF:-perf}; echo "perf: $PERF"
+          NCPU=4 sudo -E $PERF record -F 1999 -e cpu-clock -o /tmp/perf.data /tmp/new /tmp/data /tmp/o-perf 2>&1 | tail -2
+          sudo $PERF report -i /tmp/perf.data --no-children --sort sym --stdio 2>/dev/null | grep -v "^#" | grep -v "^$" | head -45 | cut -c1-150
