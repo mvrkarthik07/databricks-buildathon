@@ -510,9 +510,19 @@ fn route_rows<'a>(
     start: i64,
     end: i64,
 ) -> Vec<Vec<Row>> {
-    let lines: usize = chunks.iter().map(|(_, chunk)| memchr::memchr_iter(b'\n', chunk).count()).sum();
+    // Presizing only: estimate the row count from a prefix of every chunk rather than scanning all
+    // the input once more (a second pass over every byte, cold in cache). Spare capacity is never
+    // touched, and an underestimate just regrows.
+    let (mut sampled, mut newlines, mut total) = (0usize, 0usize, 0usize);
+    for (_, chunk) in &chunks {
+        let head = &chunk[..chunk.len().min(64 * 1024)];
+        sampled += head.len();
+        newlines += memchr::memchr_iter(b'\n', head).count();
+        total += chunk.len();
+    }
+    let lines = if sampled == 0 { 0 } else { (total as u128 * newlines as u128 / sampled as u128) as usize };
     let shard_count = dedup_shards();
-    let share = lines / shard_count + lines / shard_count / 16 + 64;
+    let share = lines / shard_count * 5 / 4 + 64;
     let mut shards: Vec<Vec<Row>> = (0..shard_count).map(|_| Vec::with_capacity(share)).collect();
     let mut dates = Dates::new();
     for (_, chunk) in chunks.iter().take(2) {
