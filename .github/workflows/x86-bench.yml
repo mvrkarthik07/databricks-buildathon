@@ -67,6 +67,13 @@ jobs:
             python3 tools/diff.py /tmp/out-new /tmp/out-base | tail -1 | sed "s|^|$bin vs base: |"
             python3 tools/diff.py /tmp/out-new /tmp/out-base | grep -q '^MATCH'
           done
+      - name: Stage laps with CPU time (SS_TIMING), base and this commit
+        run: |
+          for r in 1 2; do
+            for bin in /tmp/base /tmp/new; do
+              echo "== $bin run $r"; rm -rf /tmp/o-lap; NCPU=$(nproc) SS_TIMING=1 $bin /tmp/data /tmp/o-lap 2>&1 | cut -c1-120
+            done
+          done
       - name: Interleaved timing (base, this commit, this commit with SS_THP=0)
         run: NCPU=$(nproc) python3 tools/ab.py /tmp/data 15 /tmp/base /tmp/new /tmp/new-thp0
       - name: Other seeds, 10M events, output equality and timing

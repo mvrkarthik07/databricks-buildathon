@@ -977,7 +977,17 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
     let timing = env::var_os("SS_TIMING").is_some();
     let lap = |name: &str| {
         if timing {
-            eprintln!("{name}: {:?}", t.elapsed());
+            // Process CPU time so far (all threads), to see CPU per stage as well as wall.
+            let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+            let ms = |t: libc::timeval| t.tv_sec as f64 * 1e3 + t.tv_usec as f64 / 1e3;
+            eprintln!(
+                "{name}: wall {:.0} ms, cpu user {:.0} sys {:.0} ms, minor faults {}",
+                t.elapsed().as_secs_f64() * 1e3,
+                ms(usage.ru_utime),
+                ms(usage.ru_stime),
+                usage.ru_minflt
+            );
         }
     };
     let manifest = Mapped::open(&data.join("manifest.json"))?;
