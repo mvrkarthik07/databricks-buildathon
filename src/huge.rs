@@ -29,6 +29,8 @@ const UNIT: usize = 16 << 10;
 const MAX_UNITS: usize = 512;
 const REGION: usize = 64 << 20;
 static MID_MIN: AtomicUsize = AtomicUsize::new(64 << 10);
+// Largest free block (in 1/8ths over the request) reused for a request with no free block of its own size.
+static FIT_EIGHTHS: AtomicUsize = AtomicUsize::new(2);
 
 struct Mid {
     /// Head of the free list for blocks of `n` units, 0 when empty; a free block's first word links to the next.
@@ -44,6 +46,9 @@ static ADVISE: AtomicBool = AtomicBool::new(true);
 pub fn init() {
     if std::env::var_os("SS_THP").is_some_and(|v| v == "0") {
         ADVISE.store(false, Relaxed);
+    }
+    if let Some(n) = std::env::var("SS_FIT").ok().and_then(|v| v.parse::<usize>().ok()) {
+        FIT_EIGHTHS.store(n, Relaxed);
     }
     if let Some(n) = std::env::var("SS_MID").ok().and_then(|v| v.parse::<usize>().ok()) {
         MID_MIN.store(n, Relaxed);
@@ -72,9 +77,16 @@ fn is_mid(layout: &Layout) -> bool {
 unsafe fn mid_alloc(size: usize, zero: bool) -> *mut u8 {
     let units = size.div_ceil(UNIT);
     let mut mid = MID.lock().unwrap_or_else(|e| e.into_inner());
-    let head = mid.free[units];
+    let mut class = units;
+    // No block of this size: take the nearest bigger free one (within the allowed slack) rather
+    // than touching fresh memory.
+    let last = (units + units * FIT_EIGHTHS.load(Relaxed) / 8).min(MAX_UNITS);
+    while mid.free[class] == 0 && class < last {
+        class += 1;
+    }
+    let head = mid.free[class];
     if head != 0 {
-        mid.free[units] = unsafe { *(head as *const usize) };
+        mid.free[class] = unsafe { *(head as *const usize) };
         drop(mid);
         if zero {
             unsafe { std::ptr::write_bytes(head as *mut u8, 0, size) };
