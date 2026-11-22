@@ -680,7 +680,8 @@ fn route_rows<'a, const L: u32>(
 #[derive(Clone, Copy)]
 struct Slot {
     hash: u64,
-    batch: u32,
+    /// Batch index plus one; zero marks an empty slot.
+    batch_plus_one: u32,
     pos: u32,
 }
 
@@ -694,35 +695,38 @@ fn dedup_events<'a>(
     let mut t = prof::now();
     let sys0 = prof::thread_sys();
     let (mut pairs, mut compares) = (0u64, 0u64);
-    let mut kept: HashTable<Slot> = HashTable::with_capacity(total);
+    // Flat linear-probing table (load at most 0.75, zero slot = empty), so the slot a row will probe
+    // is known from its hash and can be prefetched a few rows ahead.
+    let size = (total * 4 / 3 + 1).next_power_of_two().max(16);
+    let mask = size - 1;
+    let mut kept = vec![Slot { hash: 0, batch_plus_one: 0, pos: 0 }; size];
+    const AHEAD: usize = 8;
     for (b, batch) in batches.iter().enumerate() {
         for (p, row) in batch.iter().enumerate() {
-            let slot = Slot {
-                hash: row.hash,
-                batch: b as u32,
-                pos: p as u32,
-            };
-            match kept.entry(
-                row.hash,
-                |old| {
-                    old.hash == row.hash && {
-                        compares += 1;
-                        cold_field(chunks, batches[old.batch as usize][old.pos as usize].line, 0)
-                            == cold_field(chunks, row.line, 0)
-                    }
-                },
-                |slot| slot.hash,
-            ) {
-                Entry::Vacant(entry) => {
-                    entry.insert(slot);
+            if let Some(next) = batch.get(p + AHEAD) {
+                prefetch(&kept[next.hash as usize & mask]);
+            }
+            let slot = Slot { hash: row.hash, batch_plus_one: b as u32 + 1, pos: p as u32 };
+            let mut i = row.hash as usize & mask;
+            loop {
+                let old = &mut kept[i];
+                if old.batch_plus_one == 0 {
+                    *old = slot;
+                    break;
                 }
-                Entry::Occupied(mut entry) => {
+                if old.hash == row.hash && {
+                    compares += 1;
+                    cold_field(chunks, batches[old.batch_plus_one as usize - 1][old.pos as usize].line, 0)
+                        == cold_field(chunks, row.line, 0)
+                } {
                     pairs += 1;
-                    let old = &batches[entry.get().batch as usize][entry.get().pos as usize];
-                    if cold_field(chunks, row.line, 3) < cold_field(chunks, old.line, 3) {
-                        *entry.get_mut() = slot;
+                    let earlier = &batches[old.batch_plus_one as usize - 1][old.pos as usize];
+                    if cold_field(chunks, row.line, 3) < cold_field(chunks, earlier.line, 3) {
+                        *old = slot;
                     }
+                    break;
                 }
+                i = (i + 1) & mask;
             }
         }
     }
@@ -733,8 +737,8 @@ fn dedup_events<'a>(
     prof::add_ns(prof::C_DUP_PAIRS, pairs);
     prof::add_ns(prof::C_KEY_COMPARES, compares);
     let mut winner: Vec<Vec<bool>> = batches.iter().map(|batch| vec![false; batch.len()]).collect();
-    for slot in &kept {
-        winner[slot.batch as usize][slot.pos as usize] = true;
+    for slot in kept.iter().filter(|slot| slot.batch_plus_one != 0) {
+        winner[slot.batch_plus_one as usize - 1][slot.pos as usize] = true;
     }
     drop(kept);
     let mut flagged = 0u64;
