@@ -14,13 +14,19 @@ on:
       mode:
         description: "bench (A/B timing and checks) or profile (prof-feature ladder and phase times)"
         default: "bench"
+      variants:
+        description: "mode=ab: semicolon-separated env settings for this commit, e.g. 'SS_BIG=1048576;SS_BIG=524288 SS_X=1'"
+        default: ""
+      rounds:
+        description: "mode=ab: interleaved rounds"
+        default: "15"
       big_events:
         description: "Events in the memory dataset (empty to skip)"
         default: "60000000"
 
 jobs:
   bench:
-    if: ${{ inputs.mode != 'profile' }}
+    if: ${{ inputs.mode == 'bench' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -151,3 +157,42 @@ jobs:
         run: |
           rm -rf /tmp/o; mkdir /tmp/o
           NCPU=1 SS_TIMING=1 /tmp/prof /tmp/data /tmp/o 2>&1 | grep -E "PROF|wall"
+
+  ab:
+    if: ${{ inputs.mode == 'ab' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - run: pip install -r ref/requirements.txt
+      - name: CPU
+        run: |
+          lscpu | grep -E "Model name|^CPU\(s\)|L2|L3"
+          echo "THP enabled: $(cat /sys/kernel/mm/transparent_hugepage/enabled)"
+      - name: Build this commit and the base, make one wrapper per variant
+        run: |
+          cargo build --release --locked
+          cp target/release/shopping-sessions /tmp/new
+          git worktree add /tmp/basetree "${{ inputs.base }}"
+          (cd /tmp/basetree && cargo build --release --locked && cp target/release/shopping-sessions /tmp/base)
+          (cd generator && cargo build --release)
+          i=0; : > /tmp/bins
+          IFS=';' read -ra V <<< "${{ inputs.variants }}"
+          for v in "${V[@]}"; do
+            i=$((i+1)); printf '#!/bin/sh\nexec env %s /tmp/new "$@"\n' "$v" > /tmp/v$i; chmod +x /tmp/v$i
+            echo "/tmp/v$i = $v"; echo "/tmp/v$i" >> /tmp/bins
+          done
+          generator/target/release/generate --seed 20261003 --events "${{ inputs.events }}" \
+            --clicks $(( ${{ inputs.events }} / 4 )) --output /tmp/data
+      - name: Output equality with the base for every variant
+        run: |
+          /tmp/base /tmp/data /tmp/out-base
+          for b in /tmp/new $(cat /tmp/bins); do
+            rm -rf /tmp/out-new; $b /tmp/data /tmp/out-new
+            python3 tools/diff.py /tmp/out-new /tmp/out-base | tail -1 | sed "s|^|$b: |"
+            python3 tools/diff.py /tmp/out-new /tmp/out-base | grep -q '^MATCH'
+          done
+      - name: Interleaved timing
+        run: NCPU=$(nproc) python3 tools/ab.py /tmp/data "${{ inputs.rounds }}" /tmp/base /tmp/new $(cat /tmp/bins)

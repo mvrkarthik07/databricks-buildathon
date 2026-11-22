@@ -12,11 +12,14 @@
 //! fails the allocation fails with null, exactly as the system allocator would when out of memory.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 
 const HUGE: usize = 2 << 20;
 const PAGE: usize = 4096;
 const BIG: usize = 4 * HUGE;
+
+// experiment: threshold overridable with SS_BIG (bytes), read once in `init` before any big block exists
+static THRESHOLD: AtomicUsize = AtomicUsize::new(BIG);
 
 static ADVISE: AtomicBool = AtomicBool::new(true);
 
@@ -25,13 +28,16 @@ pub fn init() {
     if std::env::var_os("SS_THP").is_some_and(|v| v == "0") {
         ADVISE.store(false, Relaxed);
     }
+    if let Some(n) = std::env::var("SS_BIG").ok().and_then(|v| v.parse::<usize>().ok()) {
+        THRESHOLD.store(n, Relaxed);
+    }
 }
 
 pub struct Alloc;
 
 #[inline]
 fn is_big(layout: &Layout) -> bool {
-    layout.size() >= BIG && layout.align() <= PAGE
+    layout.size() >= THRESHOLD.load(Relaxed) && layout.align() <= PAGE
 }
 
 unsafe impl GlobalAlloc for Alloc {
@@ -58,7 +64,7 @@ unsafe impl GlobalAlloc for Alloc {
             let start = (base as usize + 16 + HUGE - 1) & !(HUGE - 1);
             if ADVISE.load(Relaxed) {
                 // A hint: failure (huge pages off, or not supported) changes nothing else.
-                libc::madvise(start as *mut _, layout.size(), libc::MADV_HUGEPAGE);
+                libc::madvise(start as *mut _, (layout.size() + HUGE - 1) & !(HUGE - 1), libc::MADV_HUGEPAGE);
             }
             let header = start as *mut usize;
             header.sub(1).write(base as usize);
