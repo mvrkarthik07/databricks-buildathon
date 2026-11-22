@@ -745,14 +745,23 @@ fn dedup_events<'a>(
     let mut routed: Vec<Vec<NamedEvent>> = (0..workers).map(|_| Vec::with_capacity(share)).collect();
     let mut linked_events = 0u64;
     let mut pending: Vec<&Row> = Vec::with_capacity(BATCH);
+    // Profiling ladder: 0 skips the link lookups, 1 looks up but does not route, 2 and above is the real thing.
+    let dl = ladder_level("SS_DLADDER");
+    let mut sink_hash = 0u64;
     let mut route_pending = |pending: &mut Vec<&Row>, routed: &mut Vec<Vec<NamedEvent>>| {
         let mut keys = [(0u64, 0u64); BATCH];
         for (key, row) in keys.iter_mut().zip(pending.iter()) {
             *key = (row.user_hash, row.user_hash2);
         }
         let mut found = [None; BATCH];
-        people.resolve_batch(&keys[..pending.len()], &mut found);
+        if dl >= 1 {
+            people.resolve_batch(&keys[..pending.len()], &mut found);
+        }
         for (row, slot) in pending.drain(..).zip(found) {
+            if dl < 2 {
+                sink_hash = sink_hash.wrapping_add(row.user_hash);
+                continue;
+            }
             let (name, hash, hash2) = match slot {
                 Some(slot) => {
                     linked_events += 1;
@@ -777,6 +786,7 @@ fn dedup_events<'a>(
         }
     }
     route_pending(&mut pending, &mut routed);
+    std::hint::black_box(sink_hash);
     let mut routed_ns = 0u64;
     prof::split(&mut routed_ns, &mut t);
     prof::add_ns(prof::DEDUP_ROUTE, routed_ns);
