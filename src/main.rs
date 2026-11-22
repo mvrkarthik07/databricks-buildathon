@@ -696,6 +696,7 @@ fn dedup_events<'a>(
     let (mut pairs, mut compares) = (0u64, 0u64);
     // Profiling only: treat equal hashes as equal IDs and never read the input back (wrong output).
     let no_cold = ladder_level("SS_NOCOLD") == 1;
+    let twice = ladder_level("SS_NOCOLD") == 2;
     let mut kept: HashTable<Slot> = HashTable::with_capacity(total);
     for (b, batch) in batches.iter().enumerate() {
         for (p, row) in batch.iter().enumerate() {
@@ -710,8 +711,15 @@ fn dedup_events<'a>(
                     old.hash == row.hash && {
                         compares += 1;
                         no_cold
-                            || cold_field(chunks, batches[old.batch as usize][old.pos as usize].line, 0)
-                                == cold_field(chunks, row.line, 0)
+                            || {
+                                let oldline = batches[old.batch as usize][old.pos as usize].line;
+                                if twice {
+                                    // Second (hot) call: what the scans cost once the lines are in cache.
+                                    std::hint::black_box(cold_field(chunks, oldline, 0));
+                                    std::hint::black_box(cold_field(chunks, row.line, 0));
+                                }
+                                cold_field(chunks, oldline, 0) == cold_field(chunks, row.line, 0)
+                            }
                     }
                 },
                 |slot| slot.hash,
@@ -722,6 +730,10 @@ fn dedup_events<'a>(
                 Entry::Occupied(mut entry) => {
                     pairs += 1;
                     let old = &batches[entry.get().batch as usize][entry.get().pos as usize];
+                    if twice {
+                        std::hint::black_box(cold_field(chunks, row.line, 3));
+                        std::hint::black_box(cold_field(chunks, old.line, 3));
+                    }
                     if !no_cold && cold_field(chunks, row.line, 3) < cold_field(chunks, old.line, 3) {
                         *entry.get_mut() = slot;
                     }
