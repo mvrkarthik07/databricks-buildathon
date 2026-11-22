@@ -89,13 +89,15 @@ fn hash(text: &[u8]) -> u64 {
 /// pairs are treated as equal names: a false match needs a 128-bit collision, so the name bytes
 /// (which sit cold in the input mapping) are never read back to confirm.
 #[derive(Default)]
-struct People<'a> {
+struct People {
     table: HashTable<u32>,
     keys: Vec<(u64, u64)>,
-    names: Vec<Text<'a>>,
+    /// Where each person's name is. The bytes are read only when the person is processed, with the
+    /// next few requested ahead, because they sit cold in the input mapping.
+    names: Vec<NameRef>,
 }
 
-impl<'a> People<'a> {
+impl People {
     #[inline]
     fn find(&self, hash: u64, hash2: u64) -> Option<u32> {
         self.table
@@ -103,9 +105,9 @@ impl<'a> People<'a> {
             .copied()
     }
 
-    /// `name` is only called for a person seen for the first time.
+    /// `name` is kept only for a person seen for the first time.
     #[inline]
-    fn intern(&mut self, hash: u64, hash2: u64, name: impl FnOnce() -> Text<'a>) -> u32 {
+    fn intern(&mut self, hash: u64, hash2: u64, name: NameRef) -> u32 {
         let keys = &mut self.keys;
         match self.table.entry(
             hash,
@@ -116,7 +118,7 @@ impl<'a> People<'a> {
             Entry::Vacant(entry) => {
                 let id = u32::try_from(keys.len()).expect("too many distinct people");
                 keys.push((hash, hash2));
-                self.names.push(name());
+                self.names.push(name);
                 entry.insert(id);
                 id
             }
@@ -526,6 +528,17 @@ impl NameRef {
 
     fn line(line: Line) -> Self {
         Self(u64::from(line.chunk) << 32 | u64::from(line.offset))
+    }
+
+    /// Requests the bytes `text` will read.
+    #[inline(always)]
+    fn prefetch(self, chunks: &[Text<'_>], links: &Links<'_>) {
+        if self.0 & Self::LINKED != 0 {
+            prefetch(links.persons[(self.0 & !Self::LINKED) as usize].name.as_ptr());
+        } else {
+            let line = Line { chunk: (self.0 >> 32) as u32, offset: self.0 as u32 };
+            prefetch(chunks[line.chunk as usize].as_ptr().wrapping_add(line.offset as usize));
+        }
     }
 
     fn text<'a>(self, chunks: &[Text<'a>], links: &Links<'a>) -> Text<'a> {
@@ -1010,7 +1023,7 @@ fn aggregate<'a>(
     let event_count: usize = event_batches.iter().map(Vec::len).sum();
     let mut event_person = Vec::with_capacity(event_count);
     for event in event_batches.iter().flatten() {
-        event_person.push(people.intern(event.hash, event.hash2, || event.name.text(chunks, links)));
+        event_person.push(people.intern(event.hash, event.hash2, event.name));
     }
     let mut ns = 0u64;
     prof::split(&mut ns, &mut t);
@@ -1062,7 +1075,10 @@ fn aggregate<'a>(
     let mut active = Active::new(campaign_count);
 
     for person in 0..person_count {
-        let name = people.names[person];
+        if let Some(&ahead) = people.names.get(person + 8) {
+            ahead.prefetch(chunks, links);
+        }
+        let name = people.names[person].text(chunks, links);
         prof::split(&mut sessionize, &mut t);
         let person_events = &mut events[event_start[person] as usize..event_start[person + 1] as usize];
         person_events.sort_unstable_by_key(|event| event.ts);
