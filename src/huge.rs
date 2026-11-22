@@ -23,12 +23,12 @@ const BIG: usize = 4 * HUGE;
 static THRESHOLD: AtomicUsize = AtomicUsize::new(BIG);
 
 // Mid-size blocks (MID_MIN up to 8 MiB) come from huge-page regions and are recycled by size, so a
-// 0.5 MB route shard costs neither a 2 MiB mapping of its own nor 4 KiB page faults. Experiment: off
-// unless SS_MID=<bytes> sets the smallest size served this way.
-const UNIT: usize = 64 << 10;
-const MAX_UNITS: usize = 128;
+// 0.5 MB route shard costs neither a 2 MiB mapping of its own nor 4 KiB page faults. `SS_MID=<bytes>`
+// moves the smallest size served this way (`SS_MID=99999999` turns the pool off).
+const UNIT: usize = 16 << 10;
+const MAX_UNITS: usize = 512;
 const REGION: usize = 64 << 20;
-static MID_MIN: AtomicUsize = AtomicUsize::new(usize::MAX);
+static MID_MIN: AtomicUsize = AtomicUsize::new(64 << 10);
 
 struct Mid {
     /// Head of the free list for blocks of `n` units, 0 when empty; a free block's first word links to the next.
