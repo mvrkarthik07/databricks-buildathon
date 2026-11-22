@@ -684,6 +684,109 @@ struct Slot {
     pos: u32,
 }
 
+/// Requests the first cache lines of an input line, which sit cold in the input mapping.
+#[inline(always)]
+fn prefetch_line(chunks: &[Text<'_>], line: Line) {
+    let at = chunks[line.chunk as usize].as_ptr().wrapping_add(line.offset as usize);
+    prefetch(at);
+    prefetch(at.wrapping_add(64));
+}
+
+/// True for the copy that counts in each group of rows with one event ID: the earliest ingest time,
+/// and among equal times the copy read first (smallest batch, then position). The answer does not
+/// depend on the order copies are examined in, so copies of an already-seen hash are only collected
+/// first and resolved later with their input lines prefetched: reading those lines back to compare
+/// IDs and ingest times is a DRAM miss each, and used to be most of this phase.
+fn winners<'a>(batches: &[Vec<Row>], chunks: &[Text<'a>], total: usize) -> Vec<Vec<bool>> {
+    winners_deferred(batches, chunks, total).unwrap_or_else(|| winners_exact(batches, chunks, total))
+}
+
+/// `None` when two different IDs share a hash (a 64-bit collision), which the caller handles by
+/// comparing IDs on first sight instead.
+fn winners_deferred<'a>(batches: &[Vec<Row>], chunks: &[Text<'a>], total: usize) -> Option<Vec<Vec<bool>>> {
+    const AHEAD: usize = 8;
+    let mut kept: HashTable<Slot> = HashTable::with_capacity(total);
+    // Copies whose hash was already in the table, as (batch, position).
+    let mut later: Vec<(u32, u32)> = Vec::new();
+    for (b, batch) in batches.iter().enumerate() {
+        for (p, row) in batch.iter().enumerate() {
+            match kept.entry(row.hash, |old| old.hash == row.hash, |slot| slot.hash) {
+                Entry::Vacant(entry) => {
+                    entry.insert(Slot { hash: row.hash, batch: b as u32, pos: p as u32 });
+                }
+                Entry::Occupied(_) => later.push((b as u32, p as u32)),
+            }
+        }
+    }
+    prof::add_ns(prof::C_DUP_PAIRS, later.len() as u64);
+    for i in 0..later.len() {
+        if let Some(&(b, p)) = later.get(i + AHEAD) {
+            let row = &batches[b as usize][p as usize];
+            prefetch_line(chunks, row.line);
+            if let Some(slot) = kept.find(row.hash, |slot| slot.hash == row.hash) {
+                prefetch_line(chunks, batches[slot.batch as usize][slot.pos as usize].line);
+            }
+        }
+        let (b, p) = later[i];
+        let row = &batches[b as usize][p as usize];
+        let slot = kept
+            .find_mut(row.hash, |slot| slot.hash == row.hash)
+            .expect("the first pass inserted every hash");
+        let old = &batches[slot.batch as usize][slot.pos as usize];
+        if cold_field(chunks, old.line, 0) != cold_field(chunks, row.line, 0) {
+            return None;
+        }
+        let earlier = match cold_field(chunks, row.line, 3).cmp(&cold_field(chunks, old.line, 3)) {
+            std::cmp::Ordering::Less => true,
+            std::cmp::Ordering::Equal => (b, p) < (slot.batch, slot.pos),
+            std::cmp::Ordering::Greater => false,
+        };
+        if earlier {
+            *slot = Slot { hash: row.hash, batch: b, pos: p };
+        }
+    }
+    let mut winner: Vec<Vec<bool>> = batches.iter().map(|batch| vec![false; batch.len()]).collect();
+    for slot in &kept {
+        winner[slot.batch as usize][slot.pos as usize] = true;
+    }
+    Some(winner)
+}
+
+/// Same result as `winners_deferred`, but compares IDs the moment a hash repeats, so distinct IDs
+/// with one hash stay apart.
+fn winners_exact<'a>(batches: &[Vec<Row>], chunks: &[Text<'a>], total: usize) -> Vec<Vec<bool>> {
+    let mut kept: HashTable<Slot> = HashTable::with_capacity(total);
+    for (b, batch) in batches.iter().enumerate() {
+        for (p, row) in batch.iter().enumerate() {
+            let slot = Slot { hash: row.hash, batch: b as u32, pos: p as u32 };
+            match kept.entry(
+                row.hash,
+                |old| {
+                    old.hash == row.hash
+                        && cold_field(chunks, batches[old.batch as usize][old.pos as usize].line, 0)
+                            == cold_field(chunks, row.line, 0)
+                },
+                |slot| slot.hash,
+            ) {
+                Entry::Vacant(entry) => {
+                    entry.insert(slot);
+                }
+                Entry::Occupied(mut entry) => {
+                    let old = &batches[entry.get().batch as usize][entry.get().pos as usize];
+                    if cold_field(chunks, row.line, 3) < cold_field(chunks, old.line, 3) {
+                        *entry.get_mut() = slot;
+                    }
+                }
+            }
+        }
+    }
+    let mut winner: Vec<Vec<bool>> = batches.iter().map(|batch| vec![false; batch.len()]).collect();
+    for slot in &kept {
+        winner[slot.batch as usize][slot.pos as usize] = true;
+    }
+    winner
+}
+
 fn dedup_events<'a>(
     batches: Vec<Vec<Row>>,
     people: &Links<'a>,
@@ -693,53 +796,11 @@ fn dedup_events<'a>(
     let total: usize = batches.iter().map(Vec::len).sum();
     let mut t = prof::now();
     let sys0 = prof::thread_sys();
-    let (mut pairs, mut compares) = (0u64, 0u64);
-    let mut kept: HashTable<Slot> = HashTable::with_capacity(total);
-    for (b, batch) in batches.iter().enumerate() {
-        for (p, row) in batch.iter().enumerate() {
-            let slot = Slot {
-                hash: row.hash,
-                batch: b as u32,
-                pos: p as u32,
-            };
-            match kept.entry(
-                row.hash,
-                |old| {
-                    old.hash == row.hash && {
-                        compares += 1;
-                        cold_field(chunks, batches[old.batch as usize][old.pos as usize].line, 0)
-                            == cold_field(chunks, row.line, 0)
-                    }
-                },
-                |slot| slot.hash,
-            ) {
-                Entry::Vacant(entry) => {
-                    entry.insert(slot);
-                }
-                Entry::Occupied(mut entry) => {
-                    pairs += 1;
-                    let old = &batches[entry.get().batch as usize][entry.get().pos as usize];
-                    if cold_field(chunks, row.line, 3) < cold_field(chunks, old.line, 3) {
-                        *entry.get_mut() = slot;
-                    }
-                }
-            }
-        }
-    }
-    let mut inserted = 0u64;
-    prof::split(&mut inserted, &mut t);
-    prof::add_ns(prof::DEDUP_INSERT, inserted);
-    prof::add_ns(prof::C_ROWS, total as u64);
-    prof::add_ns(prof::C_DUP_PAIRS, pairs);
-    prof::add_ns(prof::C_KEY_COMPARES, compares);
-    let mut winner: Vec<Vec<bool>> = batches.iter().map(|batch| vec![false; batch.len()]).collect();
-    for slot in &kept {
-        winner[slot.batch as usize][slot.pos as usize] = true;
-    }
-    drop(kept);
+    let winner = winners(&batches, chunks, total);
     let mut flagged = 0u64;
     prof::split(&mut flagged, &mut t);
-    prof::add_ns(prof::DEDUP_WINNER, flagged);
+    prof::add_ns(prof::DEDUP_INSERT, flagged);
+    prof::add_ns(prof::C_ROWS, total as u64);
 
     let share = total / workers + total / workers / 8 + 16;
     let mut routed: Vec<Vec<NamedEvent>> = (0..workers).map(|_| Vec::with_capacity(share)).collect();
@@ -1407,6 +1468,49 @@ mod tests {
             assert_eq!(cold_field(&chunks, line, 0), fields[0]);
             assert_eq!(cold_field(&chunks, line, 1), fields[1]);
             assert_eq!(cold_field(&chunks, line, 3), fields[3]);
+        }
+    }
+
+    #[test]
+    fn winners_pick_the_earliest_ingest_then_the_first_copy() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for collide in [false, true] {
+            for _ in 0..200 {
+                let mut text = Vec::new();
+                let mut rows = vec![Vec::new(), Vec::new(), Vec::new()];
+                let mut copies = Vec::new(); // (id, ingest, batch, position)
+                for _ in 0..(next() % 60) {
+                    let id = next() % 7;
+                    let ingest = next() % 4;
+                    let offset = text.len() as u32;
+                    text.extend_from_slice(format!("e{id},u,ts,2026-10-01T00:00:0{ingest}Z,view,p,0\n").as_bytes());
+                    let b = (next() % 3) as usize;
+                    let hash = if collide { id % 2 } else { id * 7919 + 1 };
+                    rows[b].push(Row {
+                        hash,
+                        user_hash: 0,
+                        user_hash2: 0,
+                        ts: 0,
+                        price: 0,
+                        category: 0,
+                        line: Line { chunk: 0, offset },
+                    });
+                    copies.push((id, ingest, b, rows[b].len() - 1));
+                }
+                let chunks = [text.as_slice()];
+                let total = copies.len();
+                let got = winners(&rows, &chunks, total);
+                for &(id, ingest, b, p) in &copies {
+                    let best = copies.iter().filter(|c| c.0 == id).map(|c| (c.1, c.2, c.3)).min().unwrap();
+                    assert_eq!(got[b][p], best == (ingest, b, p), "collide {collide} copy {:?}", (id, ingest, b, p));
+                }
+            }
         }
     }
 
