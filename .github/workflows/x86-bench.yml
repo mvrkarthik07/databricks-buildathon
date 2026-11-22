@@ -196,5 +196,10 @@ jobs:
             python3 tools/diff.py /tmp/out-new /tmp/out-base | tail -1 | sed "s|^|$b: |"
             python3 tools/diff.py /tmp/out-new /tmp/out-base | grep -q '^MATCH'
           done
+      - name: Stage laps with CPU user/sys and faults (base, then this commit)
+        run: |
+          for b in /tmp/base /tmp/new; do
+            echo "== $b"; rm -rf /tmp/o-lap; NCPU=$(nproc) SS_TIMING=1 $b /tmp/data /tmp/o-lap 2>&1 | cut -c1-120
+          done
       - name: Interleaved timing
         run: NCPU=$(nproc) python3 tools/ab.py /tmp/data "${{ inputs.rounds }}" /tmp/base /tmp/new $(cat /tmp/bins)
