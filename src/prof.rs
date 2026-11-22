@@ -31,8 +31,9 @@ pub const C_PEOPLE: usize = 21;
 pub const C_SESSIONS: usize = 22;
 pub const C_CLICKS_KEPT: usize = 23;
 pub const C_LINKED_EVENTS: usize = 24;
+pub const AGG_PARTITION: usize = 25;
 
-const NAMES: [&str; 25] = [
+const NAMES: [&str; 26] = [
     "route_rows (parse+hash+validate+push)",
     "dedup: table insert + compares",
     "dedup: winner flags",
@@ -58,9 +59,10 @@ const NAMES: [&str; 25] = [
     "count: sessions",
     "count: clicks kept",
     "count: events routed to linked person",
+    "aggregate: partition into buckets",
 ];
 
-static TOTAL: [AtomicU64; 25] = [const { AtomicU64::new(0) }; 25];
+static TOTAL: [AtomicU64; 26] = [const { AtomicU64::new(0) }; 26];
 
 /// Per-thread kernel time (microseconds) and minor page faults, by phase.
 pub const S_ROUTE: usize = 0;

@@ -551,6 +551,7 @@ impl NameRef {
     }
 }
 
+#[derive(Clone, Copy)]
 struct NamedEvent {
     name: NameRef,
     hash: u64,
@@ -565,6 +566,7 @@ struct Click<'a> {
     campaign: u32,
 }
 
+#[derive(Clone, Copy)]
 struct NamedClick<'a> {
     hash: u64,
     hash2: u64,
@@ -1010,6 +1012,29 @@ fn group_by_person<T: Copy + Default>(
     (grouped, start)
 }
 
+/// What a worker's people add up to, across all the buckets it processes.
+struct Accum<'a> {
+    users: Vec<UserRow<'a>>,
+    campaigns: DailyTotals,
+    spend: Vec<i64>,
+    touched: Vec<usize>,
+    active: Active,
+}
+
+/// Events per bucket the aggregation aims for: small enough that a bucket's people table, grouped
+/// events and sort all stay in cache. `SS_BUCKET_EVENTS` overrides it (tests use tiny buckets).
+fn bucket_events() -> usize {
+    env::var("SS_BUCKET_EVENTS").ok().and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(16_384)
+}
+
+#[inline]
+fn bucket_of(hash2: u64, buckets: usize) -> usize {
+    (((hash2 >> 32) * buckets as u64) >> 32) as usize
+}
+
+/// Splits a worker's people into buckets by their identity hash, so every person's events and
+/// clicks land in one bucket, and aggregates the buckets one after another. Interning, grouping and
+/// sorting then work on a cache-sized slice instead of the worker's whole share.
 fn aggregate<'a>(
     event_batches: Vec<Vec<NamedEvent>>,
     click_batches: Vec<Vec<NamedClick<'a>>>,
@@ -1018,6 +1043,51 @@ fn aggregate<'a>(
     chunks: &[Text<'a>],
     links: &Links<'a>,
 ) -> (Vec<UserRow<'a>>, DailyTotals) {
+    let events: usize = event_batches.iter().map(Vec::len).sum();
+    let clicks: usize = click_batches.iter().map(Vec::len).sum();
+    let campaign_count = catalog.campaigns.names.len();
+    let mut acc = Accum {
+        users: Vec::new(),
+        campaigns: DailyTotals::new(first_day, last_day, campaign_count),
+        spend: vec![0i64; catalog.categories.names.len()],
+        touched: Vec::new(),
+        active: Active::new(campaign_count),
+    };
+    let buckets = events.div_ceil(bucket_events()).clamp(1, 4096);
+    if buckets == 1 {
+        aggregate_part(event_batches, click_batches, catalog, chunks, links, &mut acc);
+    } else {
+        let t = prof::now();
+        let mut event_buckets: Vec<Vec<NamedEvent>> =
+            (0..buckets).map(|_| Vec::with_capacity(events / buckets * 5 / 4 + 16)).collect();
+        for batch in event_batches {
+            for event in &batch {
+                event_buckets[bucket_of(event.hash2, buckets)].push(*event);
+            }
+        }
+        let mut click_buckets: Vec<Vec<NamedClick<'a>>> =
+            (0..buckets).map(|_| Vec::with_capacity(clicks / buckets * 5 / 4 + 16)).collect();
+        for batch in click_batches {
+            for click in &batch {
+                click_buckets[bucket_of(click.hash2, buckets)].push(*click);
+            }
+        }
+        prof::add(prof::AGG_PARTITION, t);
+        for (events, clicks) in event_buckets.into_iter().zip(click_buckets) {
+            aggregate_part(vec![events], vec![clicks], catalog, chunks, links, &mut acc);
+        }
+    }
+    (acc.users, acc.campaigns)
+}
+
+fn aggregate_part<'a>(
+    event_batches: Vec<Vec<NamedEvent>>,
+    click_batches: Vec<Vec<NamedClick<'a>>>,
+    catalog: &Catalog<'a>,
+    chunks: &[Text<'a>],
+    links: &Links<'a>,
+    acc: &mut Accum<'a>,
+) {
     let mut t = prof::now();
     let mut people = People::default();
     let event_count: usize = event_batches.iter().map(Vec::len).sum();
@@ -1067,12 +1137,7 @@ fn aggregate<'a>(
     let (mut sort_events, mut sort_clicks, mut sessionize, mut flush) = (0u64, 0u64, 0u64, 0u64);
     let mut sessions_total = 0u64;
 
-    let mut users = Vec::new();
-    let campaign_count = catalog.campaigns.names.len();
-    let mut campaigns = DailyTotals::new(first_day, last_day, campaign_count);
-    let mut spend = vec![0i64; catalog.categories.names.len()];
-    let mut touched = Vec::new();
-    let mut active = Active::new(campaign_count);
+    let Accum { users, campaigns, spend, touched, active } = acc;
 
     for person in 0..person_count {
         if let Some(&ahead) = people.names.get(person + 8) {
@@ -1110,7 +1175,7 @@ fn aggregate<'a>(
             sessions_total += 1;
             if daily.sessions != 0 && daily.day != day {
                 prof::split(&mut sessionize, &mut t);
-                flush_daily(&mut users, daily, &mut touched, &mut spend, catalog);
+                flush_daily(users, daily, touched, spend, catalog);
                 prof::split(&mut flush, &mut t);
                 daily = UserRow::new(name);
             }
@@ -1154,7 +1219,7 @@ fn aggregate<'a>(
             total.revenue += revenue;
         }
         prof::split(&mut sessionize, &mut t);
-        flush_daily(&mut users, daily, &mut touched, &mut spend, catalog);
+        flush_daily(users, daily, touched, spend, catalog);
         prof::split(&mut flush, &mut t);
     }
     prof::add_ns(prof::AGG_SORT_EVENTS, sort_events);
@@ -1162,7 +1227,6 @@ fn aggregate<'a>(
     prof::add_ns(prof::AGG_SESSIONIZE, sessionize);
     prof::add_ns(prof::AGG_FLUSH, flush);
     prof::add_ns(prof::C_SESSIONS, sessions_total);
-    (users, campaigns)
 }
 
 fn flush_daily<'a>(
