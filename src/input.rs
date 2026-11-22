@@ -339,6 +339,26 @@ pub fn timestamp_cached(raw: &[u8], dates: &mut Dates) -> Option<i64> {
         if day == BAD_DATE {
             return None;
         }
+        if let Ok(raw) = <&[u8; 20]>::try_from(raw) {
+            // `HH:MM:SS` in one 8-byte load, then the zone byte, which must be `Z`.
+            let x = u64::from_le_bytes(raw[11..19].try_into().unwrap());
+            let y = (x ^ 0x3030_3030_3030_3030) & 0xFFFF_00FF_FF00_FFFF;
+            let (hour, minute, second) = (
+                (y & 0xFF) * 10 + ((y >> 8) & 0xFF),
+                ((y >> 24) & 0xFF) * 10 + ((y >> 32) & 0xFF),
+                ((y >> 48) & 0xFF) * 10 + (y >> 56),
+            );
+            if (x >> 16) & 0xFF == u64::from(b':')
+                && (x >> 40) & 0xFF == u64::from(b':')
+                && raw[19] == b'Z'
+                && ((y + 0x7676_7676_7676_7676) | y) & 0x8080_8080_8080_8080 == 0
+                && hour < 24
+                && minute < 60
+                && second < 60
+            {
+                return Some(day + ((hour as i64 * 60 + minute as i64) * 60 + second as i64) * 1000);
+            }
+        }
         return time_of_day(&raw[11..], day);
     }
     timestamp(raw)
@@ -800,5 +820,39 @@ mod tests {
             fast_hits += usize::from(expected);
         }
         assert!(fast_hits > 10_000);
+    }
+
+    #[test]
+    fn cached_timestamps_match_the_plain_parse() {
+        let mut state = 0xdead_beef_cafe_f00du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let alphabet = *b"0123456789:Z-T+ 9\x80/;";
+        let samples: [&[u8]; 4] = [
+            b"2026-10-03T12:34:56Z",
+            b"2026-10-03T12:34:56+09:30",
+            b"2026-10-03T12:34:56",
+            b"2026-02-29T23:59:59Z",
+        ];
+        let mut dates = Dates::new();
+        let mut valid = 0;
+        for _ in 0..500_000 {
+            let mut raw = samples[(next() % 4) as usize].to_vec();
+            for _ in 0..next() % 4 {
+                let at = (next() % raw.len() as u64) as usize;
+                raw[at] = if next() % 3 == 0 { alphabet[(next() % 19) as usize] } else { b'0' + (next() % 10) as u8 };
+            }
+            if next() % 20 == 0 {
+                raw.truncate((next() % 26) as usize);
+            }
+            let expected = timestamp(&raw);
+            assert_eq!(timestamp_cached(&raw, &mut dates), expected, "{:?}", String::from_utf8_lossy(&raw));
+            valid += usize::from(expected.is_some());
+        }
+        assert!(valid > 50_000);
     }
 }
