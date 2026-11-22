@@ -1,5 +1,11 @@
 mod input;
 mod output;
+#[cfg(target_os = "linux")]
+mod huge;
+
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static ALLOC: huge::Alloc = huge::Alloc;
 
 use std::cmp::{Reverse, min};
 use std::env;
@@ -21,7 +27,14 @@ use output::{CampaignRow, UserRow};
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 type Text<'a> = &'a [u8];
-const DEDUP_SHARDS: usize = 64;
+/// Rows per dedup shard that keep a shard's hash table (about 24 bytes a row) inside a 2 MiB L2.
+const SHARD_ROWS: usize = 40_000;
+
+/// Dedup shards for `event_bytes` of input (about 88 bytes a row): enough that a shard's table
+/// stays cache-resident, between 32 and 4096. A power of two, as the shard index is a remainder.
+fn dedup_shards(event_bytes: usize) -> usize {
+    (event_bytes / 88 / SHARD_ROWS).next_power_of_two().clamp(32, 4096)
+}
 
 /// A second hash, independent of `hash`, built from folded 128-bit multiplies.
 fn hash2(text: &[u8]) -> u64 {
@@ -483,10 +496,11 @@ fn route_rows<'a>(
     catalog: &Catalog<'a>,
     start: i64,
     end: i64,
+    shard_count: usize,
 ) -> Vec<Vec<Row>> {
     let lines: usize = chunks.iter().map(|(_, chunk)| memchr::memchr_iter(b'\n', chunk).count()).sum();
-    let share = lines / DEDUP_SHARDS + lines / DEDUP_SHARDS / 16 + 64;
-    let mut shards: Vec<Vec<Row>> = (0..DEDUP_SHARDS).map(|_| Vec::with_capacity(share)).collect();
+    let share = lines / shard_count + lines / shard_count / 16 + 64;
+    let mut shards: Vec<Vec<Row>> = (0..shard_count).map(|_| Vec::with_capacity(share)).collect();
     let mut dates = Dates::new();
     for (_, chunk) in chunks.iter().take(2) {
         will_need(chunk);
@@ -505,7 +519,7 @@ fn route_rows<'a>(
         let hash = hash(id);
         // Keep shard bits separate from hashbrown's low bucket bits (below 2^32 buckets) and its
         // top seven tag bits.
-        let shard = ((hash >> 40) as usize) % DEDUP_SHARDS;
+        let shard = ((hash >> 40) as usize) % shard_count;
         let parsed = (|| {
             if user.is_empty() || product.is_empty() {
                 return None;
@@ -998,6 +1012,7 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
     });
     let (links, event_files, click_files) = files?;
     lap("catalog + files");
+    let shards = dedup_shards(event_files.iter().map(|file| file.bytes().len()).sum());
     let (event_chunks, event_batches) = index_chunks(chunk_batches(&event_files, workers))?;
     let link_rows = parallel(chunk_batches(&links, workers), workers, parse_links);
     lap("link parse");
@@ -1011,12 +1026,12 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
             people
         });
         let copies = parallel(event_batches, workers, |chunks| {
-            route_rows(chunks, &catalog, start, end)
+            route_rows(chunks, &catalog, start, end, shards)
         });
         (people.join().unwrap(), copies)
     });
     lap("links+route");
-    let events = parallel(transpose(copies, DEDUP_SHARDS), workers, |batches| {
+    let events = parallel(transpose(copies, shards), workers, |batches| {
         dedup_events(batches, &people, &event_chunks, workers)
     });
     lap("dedup");
@@ -1074,6 +1089,8 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    huge::init();
     let mut args = env::args_os().skip(1);
     let mut path =
         |key, default| PathBuf::from(args.next().or_else(|| env::var_os(key)).unwrap_or(default));

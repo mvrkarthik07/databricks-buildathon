@@ -1,15 +1,19 @@
-# Manual only. Reports the runner's CPU flags first, so an AVX2 or AVX-512 result is never assumed,
-# then checks correctness and A/B-times the current commit against BASE on x86-64.
+# Manual only. Reports the runner's CPU, then checks correctness of this commit against the Python
+# oracle and the base build, A/B-times it against BASE on x86-64, and measures memory on a large
+# dataset. Runner times are for comparing builds on one runner, never an official score.
 name: x86-bench
 on:
   workflow_dispatch:
     inputs:
       base:
-        description: "Commit to compare against (the pre-optimization build)"
-        default: "6c87438"
+        description: "Commit to compare against (the scored build)"
+        default: "0141e3d"
       events:
-        description: "Events in the generated dataset"
-        default: "5000000"
+        description: "Events in the timing dataset"
+        default: "20000000"
+      big_events:
+        description: "Events in the memory dataset (empty to skip)"
+        default: "60000000"
 
 jobs:
   bench:
@@ -18,33 +22,73 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: CPU and memory
+      - name: CPU, memory, huge-page setting, disk
         run: |
           lscpu | grep -E "Model name|^CPU\(s\)|Thread|L2|L3"
           echo "flags: $(grep -m1 flags /proc/cpuinfo | tr ' ' '\n' | grep -E '^(avx2|avx512[a-z_0-9]*|bmi2|popcnt)$' | sort -u | tr '\n' ' ')"
-          free -m | head -2
+          echo "THP enabled: $(cat /sys/kernel/mm/transparent_hugepage/enabled)"
+          free -m | head -2; df -h / | tail -1
       - uses: dtolnay/rust-toolchain@stable
-      - run: pip install pyarrow
-      - name: Build current and base
+      - run: pip install -r ref/requirements.txt
+      - name: Build this commit and the base
         run: |
           cargo build --release --locked
           cp target/release/shopping-sessions /tmp/new
           git worktree add /tmp/basetree "${{ inputs.base }}"
           (cd /tmp/basetree && cargo build --release --locked && cp target/release/shopping-sessions /tmp/base)
           (cd generator && cargo build --release)
-      - name: Unit tests and published fixtures
+          printf '#!/bin/sh\nSS_THP=0 exec /tmp/new "$@"\n' > /tmp/new-thp0; chmod +x /tmp/new-thp0
+      - name: Unit tests (include the allocator tests)
+        run: cargo test --release --locked
+      - name: Adversarial fixtures and the Python oracle, huge pages on and off, 1/3/8 workers
+        # The 36 published fixtures sit in the git-ignored starter-duckdb/, so they are checked locally only.
         run: |
-          cargo test --release --locked
-          make check-fixtures check-adversarial PYTHON=python3 REF=/tmp/new
-      - name: Dataset
+          for bin in /tmp/new /tmp/new-thp0; do
+            echo "== $bin"
+            make check-adversarial PYTHON=python3 REF=$bin | tail -1
+          done
+          for seed in 11 22 33 44; do
+            generator/target/release/generate --seed $seed --events 200000 --clicks 50000 --output /tmp/small$seed
+            python3 ref/reference.py /tmp/small$seed /tmp/oracle$seed > /dev/null
+            for bin in /tmp/new /tmp/new-thp0; do
+              for n in 1 3 8; do
+                rm -rf /tmp/o; NCPU=$n $bin /tmp/small$seed /tmp/o
+                python3 tools/diff.py /tmp/o /tmp/oracle$seed | grep -q '^MATCH' && echo "seed $seed $bin NCPU=$n: MATCH" || { echo "seed $seed $bin NCPU=$n: DIFFERENT"; exit 1; }
+              done
+            done
+          done
+      - name: Timing dataset and output equality with the base
         run: |
           generator/target/release/generate --seed 20261003 --events "${{ inputs.events }}" \
             --clicks $(( ${{ inputs.events }} / 4 )) --output /tmp/data
-      - name: Output matches the base build
-        run: |
           /tmp/base /tmp/data /tmp/out-base
-          /tmp/new /tmp/data /tmp/out-new
-          python3 tools/diff.py /tmp/out-new /tmp/out-base | tail -3
-      - name: Interleaved timing (runner has few cores; NCPU is clamped to 1..8)
+          for bin in /tmp/new /tmp/new-thp0; do
+            rm -rf /tmp/out-new; $bin /tmp/data /tmp/out-new
+            python3 tools/diff.py /tmp/out-new /tmp/out-base | tail -1 | sed "s|^|$bin vs base: |"
+            python3 tools/diff.py /tmp/out-new /tmp/out-base | grep -q '^MATCH'
+          done
+      - name: Interleaved timing (base, this commit, this commit with SS_THP=0)
+        run: NCPU=$(nproc) python3 tools/ab.py /tmp/data 15 /tmp/base /tmp/new /tmp/new-thp0
+      - name: Other seeds, 10M events, output equality and timing
         run: |
-          NCPU=$(nproc) python3 tools/ab.py /tmp/data 21 /tmp/base /tmp/new
+          for seed in 7 99; do
+            generator/target/release/generate --seed $seed --events 10000000 --clicks 2500000 --output /tmp/x$seed
+            /tmp/base /tmp/x$seed /tmp/o1; rm -rf /tmp/o2; /tmp/new /tmp/x$seed /tmp/o2
+            python3 tools/diff.py /tmp/o2 /tmp/o1 | tail -1 | sed "s/^/seed $seed: /"; python3 tools/diff.py /tmp/o2 /tmp/o1 | grep -q '^MATCH'
+            rm -rf /tmp/o1 /tmp/o2
+            echo "== seed $seed"; NCPU=$(nproc) python3 tools/ab.py /tmp/x$seed 9 /tmp/base /tmp/new
+          done
+      - name: Large dataset, peak memory (24 GB limit)
+        if: ${{ inputs.big_events != '' }}
+        run: |
+          rm -rf /tmp/data /tmp/x7 /tmp/x99 /tmp/out-base /tmp/out-new
+          generator/target/release/generate --seed 20261003 --events "${{ inputs.big_events }}" \
+            --clicks $(( ${{ inputs.big_events }} / 4 )) --output /tmp/big
+          du -sh /tmp/big; df -h / | tail -1
+          for bin in /tmp/base /tmp/new /tmp/new-thp0; do
+            rm -rf /tmp/big-out-$(basename $bin)
+            echo "== $bin"; NCPU=$(nproc) /usr/bin/time -v $bin /tmp/big /tmp/big-out-$(basename $bin) 2>&1 | grep -E "Maximum resident|Elapsed|Minor|Exit status"
+          done
+          for out in new new-thp0; do
+            python3 tools/diff.py /tmp/big-out-$out /tmp/big-out-base | tail -1 | sed "s/^/60M $out vs base: /"
+          done
