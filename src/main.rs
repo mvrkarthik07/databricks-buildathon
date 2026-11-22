@@ -289,19 +289,47 @@ struct LinkTarget<'a> {
     hash2: u64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct LinkSlot {
     key: (u64, u64),
     /// The person's own two hashes, so routing an event needs no second memory access.
     target: (u64, u64),
-    person: u32,
+    /// Dense person index plus one; zero marks an empty slot.
+    person_plus_one: u32,
+}
+
+impl LinkSlot {
+    #[inline]
+    fn person(&self) -> u32 {
+        self.person_plus_one - 1
+    }
+}
+
+/// Lookups per batch. The table is far bigger than any cache, so a lookup is a DRAM miss; a batch
+/// issues all of its misses before waiting for the first.
+const BATCH: usize = 16;
+
+#[inline(always)]
+fn prefetch<T>(ptr: *const T) {
+    // SAFETY: a prefetch is a hint; it never faults and reads nothing the program can observe.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr.cast());
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) ptr, options(nostack, preserves_flags));
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = ptr;
 }
 
 /// Maps a linked ID to its person, found by the ID's two hashes. IDs that are their own person
 /// are absent. A one-hash bloom filter answers the common "not linked" case without touching the
-/// table. Slots hold a dense person index; the person's name and hashes live in `persons`.
+/// table. The table is flat with linear probing, so a lookup's first slot address is known from
+/// the hash and can be prefetched; `persons` holds each person's name.
 struct Links<'a> {
-    table: HashTable<LinkSlot>,
+    slots: Vec<LinkSlot>,
     persons: Vec<LinkTarget<'a>>,
     bloom: Vec<u64>,
     shift: u32,
@@ -311,30 +339,73 @@ impl<'a> Links<'a> {
     fn with_capacity(count: usize) -> Self {
         let bits = (count.max(1) * 32).next_power_of_two().max(64);
         Links {
-            table: HashTable::with_capacity(count),
+            // Load factor at most 0.6. Zeroed memory is the empty table.
+            slots: vec![LinkSlot::default(); count * 5 / 3 + 16],
             persons: Vec::new(),
             bloom: vec![0; bits / 64],
             shift: 64 - bits.trailing_zeros(),
         }
     }
 
+    #[inline(always)]
+    fn first_slot(&self, hash: u64) -> usize {
+        ((u128::from(hash) * self.slots.len() as u128) >> 64) as usize
+    }
+
     fn insert(&mut self, key: (u64, u64), person: u32) {
         let bit = (key.0 >> self.shift) as usize;
         self.bloom[bit / 64] |= 1 << (bit % 64);
         let target = &self.persons[person as usize];
-        let slot = LinkSlot { key, target: (target.hash, target.hash2), person };
-        self.table.insert_unique(key.0, slot, |slot| slot.key.0);
+        let slot = LinkSlot { key, target: (target.hash, target.hash2), person_plus_one: person + 1 };
+        let mut i = self.first_slot(key.0);
+        while self.slots[i].person_plus_one != 0 {
+            i = if i + 1 == self.slots.len() { 0 } else { i + 1 };
+        }
+        self.slots[i] = slot;
     }
 
-    /// The person this ID belongs to, if the ID is linked to another.
-    #[inline]
-    fn resolve(&self, hash: u64, hash2: u64) -> Option<&LinkSlot> {
+    #[inline(always)]
+    fn bloom_hit(&self, hash: u64) -> bool {
         let bit = (hash >> self.shift) as usize;
-        if self.bloom[bit / 64] >> (bit % 64) & 1 == 0 {
-            return None;
+        self.bloom[bit / 64] >> (bit % 64) & 1 != 0
+    }
+
+    #[inline(always)]
+    fn probe(&self, hash: u64, hash2: u64) -> Option<&LinkSlot> {
+        let mut i = self.first_slot(hash);
+        loop {
+            let slot = &self.slots[i];
+            if slot.person_plus_one == 0 {
+                return None;
+            }
+            if slot.key == (hash, hash2) {
+                return Some(slot);
+            }
+            i = if i + 1 == self.slots.len() { 0 } else { i + 1 };
         }
-        self.table
-            .find(hash, |slot| slot.key == (hash, hash2))
+    }
+
+    /// The person each ID belongs to, if the ID is linked to another, for up to `BATCH` keys at once: all bloom words are requested, then all table
+    /// slots that pass the bloom filter, then the lookups run on cache lines already on the way.
+    #[inline]
+    fn resolve_batch<'s>(&'s self, keys: &[(u64, u64)], out: &mut [Option<&'s LinkSlot>; BATCH]) {
+        debug_assert!(keys.len() <= BATCH);
+        for &(hash, _) in keys {
+            prefetch(&self.bloom[(hash >> self.shift) as usize / 64]);
+        }
+        let mut maybe = [false; BATCH];
+        for (i, &(hash, _)) in keys.iter().enumerate() {
+            if self.bloom_hit(hash) {
+                maybe[i] = true;
+                let slot: *const LinkSlot = &self.slots[self.first_slot(hash)];
+                // A slot can straddle two cache lines.
+                prefetch(slot);
+                prefetch(slot.wrapping_byte_add(std::mem::size_of::<LinkSlot>() - 1));
+            }
+        }
+        for (i, &(hash, hash2)) in keys.iter().enumerate() {
+            out[i] = if maybe[i] { self.probe(hash, hash2) } else { None };
+        }
     }
 }
 
@@ -611,9 +682,7 @@ struct Slot {
     pos: u32,
 }
 
-/// `DL` is a profiling ladder for the survivor loop: 0 only walks the winner flags, 1 adds the
-/// link lookup, 2 and above routes the event. The scored build uses 99.
-fn dedup_events<'a, const DL: u32>(
+fn dedup_events<'a>(
     batches: Vec<Vec<Row>>,
     people: &Links<'a>,
     chunks: &[Text<'a>],
@@ -622,7 +691,6 @@ fn dedup_events<'a, const DL: u32>(
     let total: usize = batches.iter().map(Vec::len).sum();
     let mut t = prof::now();
     let sys0 = prof::thread_sys();
-    let mut sink = 0u64;
     let (mut pairs, mut compares) = (0u64, 0u64);
     let mut kept: HashTable<Slot> = HashTable::with_capacity(total);
     for (b, batch) in batches.iter().enumerate() {
@@ -674,48 +742,54 @@ fn dedup_events<'a, const DL: u32>(
     let share = total / workers + total / workers / 8 + 16;
     let mut routed: Vec<Vec<NamedEvent>> = (0..workers).map(|_| Vec::with_capacity(share)).collect();
     let mut linked_events = 0u64;
-    for (batch, winner) in batches.iter().zip(&winner) {
-        for (row, _) in batch.iter().zip(winner).filter(|&(row, &win)| win && row.category != INVALID) {
-            if DL == 0 {
-                sink = sink.wrapping_add(row.ts as u64);
-                continue;
-            }
-            let (name, hash, hash2) = match people.resolve(row.user_hash, row.user_hash2) {
+    let mut pending: Vec<&Row> = Vec::with_capacity(BATCH);
+    let mut route_pending = |pending: &mut Vec<&Row>, routed: &mut Vec<Vec<NamedEvent>>| {
+        let mut keys = [(0u64, 0u64); BATCH];
+        for (key, row) in keys.iter_mut().zip(pending.iter()) {
+            *key = (row.user_hash, row.user_hash2);
+        }
+        let mut found = [None; BATCH];
+        people.resolve_batch(&keys[..pending.len()], &mut found);
+        for (row, slot) in pending.drain(..).zip(found) {
+            let (name, hash, hash2) = match slot {
                 Some(slot) => {
                     linked_events += 1;
-                    (NameRef::linked(slot.person), slot.target.0, slot.target.1)
+                    (NameRef::linked(slot.person()), slot.target.0, slot.target.1)
                 }
                 None => (NameRef::line(row.line), row.user_hash, row.user_hash2),
             };
-            if DL == 1 {
-                sink = sink.wrapping_add(hash ^ hash2 ^ name.0);
-                continue;
-            }
             routed[worker_of(hash, workers)].push(NamedEvent {
                 name,
                 hash,
                 hash2,
-                event: Event {
-                    ts: row.ts,
-                    price: row.price,
-                    category: row.category,
-                },
+                event: Event { ts: row.ts, price: row.price, category: row.category },
             });
         }
+    };
+    for (batch, winner) in batches.iter().zip(&winner) {
+        for (row, _) in batch.iter().zip(winner).filter(|&(row, &win)| win && row.category != INVALID) {
+            pending.push(row);
+            if pending.len() == BATCH {
+                route_pending(&mut pending, &mut routed);
+            }
+        }
     }
+    route_pending(&mut pending, &mut routed);
     let mut routed_ns = 0u64;
     prof::split(&mut routed_ns, &mut t);
     prof::add_ns(prof::DEDUP_ROUTE, routed_ns);
-    std::hint::black_box(sink);
     prof::add_sys(prof::S_DEDUP, sys0);
     prof::add_ns(prof::C_LINKED_EVENTS, linked_events);
     prof::add_ns(prof::C_SURVIVORS, routed.iter().map(|r| r.len() as u64).sum());
     routed
 }
 
-/// `CL` is a profiling ladder: 1 splits, 2 adds the campaign lookup, 3 the timestamp, 4 the user
-/// hashes, 5 the link lookup, 6 and above routes the click. The scored build uses 99.
-fn route_clicks<'a, const CL: u32>(
+struct PendingClick<'a> {
+    user: (u64, u64),
+    click: Click<'a>,
+}
+
+fn route_clicks<'a>(
     chunks: Vec<Text<'a>>,
     people: &Links<'a>,
     catalog: &Catalog<'a>,
@@ -725,9 +799,21 @@ fn route_clicks<'a, const CL: u32>(
 ) -> Vec<Vec<NamedClick<'a>>> {
     let t0 = prof::now();
     let sys0 = prof::thread_sys();
-    let mut sink = 0u64;
     let mut routed: Vec<Vec<NamedClick>> = (0..workers).map(|_| Vec::new()).collect();
     let mut dates = Dates::new();
+    let mut pending: Vec<PendingClick> = Vec::with_capacity(BATCH);
+    let route_pending = |pending: &mut Vec<PendingClick<'a>>, routed: &mut Vec<Vec<NamedClick<'a>>>| {
+        let mut keys = [(0u64, 0u64); BATCH];
+        for (key, p) in keys.iter_mut().zip(pending.iter()) {
+            *key = p.user;
+        }
+        let mut found = [None; BATCH];
+        people.resolve_batch(&keys[..pending.len()], &mut found);
+        for (p, slot) in pending.drain(..).zip(found) {
+            let (hash, hash2) = slot.map_or(p.user, |slot| slot.target);
+            routed[worker_of(hash, workers)].push(NamedClick { hash, hash2, click: p.click });
+        }
+    };
     for chunk in chunks.iter().take(2) {
         will_need(chunk);
     }
@@ -736,10 +822,6 @@ fn route_clicks<'a, const CL: u32>(
             will_need(ahead);
         }
         rows::<4>(chunk, |[id, user, campaign, ts]| {
-        if CL == 1 {
-            sink = sink.wrapping_add((id.len() + user.len() + campaign.len() + ts.len()) as u64);
-            return;
-        }
         if id.is_empty() || user.is_empty() {
             return;
         }
@@ -749,43 +831,20 @@ fn route_clicks<'a, const CL: u32>(
         if campaign == catalog.organic {
             return;
         }
-        if CL == 2 {
-            sink = sink.wrapping_add(u64::from(campaign));
-            return;
-        }
         let Some(ts) = timestamp_cached(ts, &mut dates) else { return };
         if ts < start - WEEK || ts >= end {
             return;
         }
-        if CL == 3 {
-            sink = sink.wrapping_add(ts as u64);
-            return;
-        }
-        let (user_hash, user_hash2) = (crate::hash(user), self::hash2(user));
-        if CL == 4 {
-            sink = sink.wrapping_add(user_hash ^ user_hash2);
-            return;
-        }
-        let (hash, hash2) = match people.resolve(user_hash, user_hash2) {
-            Some(slot) => slot.target,
-            None => (user_hash, user_hash2),
-        };
-        if CL == 5 {
-            sink = sink.wrapping_add(hash ^ hash2);
-            return;
-        }
-        routed[worker_of(hash, workers)].push(NamedClick {
-            hash,
-            hash2,
-            click: Click {
-                ts,
-                id,
-                campaign,
-            },
+        pending.push(PendingClick {
+            user: (crate::hash(user), self::hash2(user)),
+            click: Click { ts, id, campaign },
         });
+        if pending.len() == BATCH {
+            route_pending(&mut pending, &mut routed);
+        }
         });
     }
-    std::hint::black_box(sink);
+    route_pending(&mut pending, &mut routed);
     prof::add(prof::CLICKS, t0);
     prof::add_sys(prof::S_CLICKS, sys0);
     routed
@@ -1201,27 +1260,14 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
         (people.join().unwrap(), copies)
     });
     lap("links+route");
-    let dedup_ladder = ladder_level("SS_DLADDER");
-    let events = parallel(transpose(copies, shards), workers, |batches| match dedup_ladder {
-        0 => dedup_events::<0>(batches, &people, &event_chunks, workers),
-        1 => dedup_events::<1>(batches, &people, &event_chunks, workers),
-        _ => dedup_events::<99>(batches, &people, &event_chunks, workers),
+    let events = parallel(transpose(copies, shards), workers, |batches| {
+        dedup_events(batches, &people, &event_chunks, workers)
     });
     lap("dedup");
-    let click_ladder = ladder_level("SS_CLADDER");
-    let clicks = parallel(chunk_batches(&click_files, workers), workers, |chunks| match click_ladder {
-        1 => route_clicks::<1>(chunks, &people, &catalog, start, end, workers),
-        2 => route_clicks::<2>(chunks, &people, &catalog, start, end, workers),
-        3 => route_clicks::<3>(chunks, &people, &catalog, start, end, workers),
-        4 => route_clicks::<4>(chunks, &people, &catalog, start, end, workers),
-        5 => route_clicks::<5>(chunks, &people, &catalog, start, end, workers),
-        _ => route_clicks::<99>(chunks, &people, &catalog, start, end, workers),
+    let clicks = parallel(chunk_batches(&click_files, workers), workers, |chunks| {
+        route_clicks(chunks, &people, &catalog, start, end, workers)
     });
     lap("clicks");
-    if dedup_ladder < 2 || click_ladder < 6 {
-        prof::report();
-        std::process::exit(0);
-    }
 
     let user_folder = out.join("user_daily");
     let campaign_folder = out.join("campaign_daily");
@@ -1309,6 +1355,38 @@ mod tests {
     fn next(state: &mut u64) -> u64 {
         *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         *state >> 33
+    }
+
+    #[test]
+    fn batched_lookup_matches_a_map() {
+        let mut state = 99;
+        let mut links = Links::with_capacity(5_000);
+        let mut model = std::collections::HashMap::new();
+        for person in 0..300u32 {
+            links.persons.push(LinkTarget { name: b"p", hash: u64::from(person) * 7, hash2: u64::from(person) * 13 });
+        }
+        for _ in 0..5_000 {
+            let key = (next(&mut state) << 20 | next(&mut state), next(&mut state));
+            let person = (next(&mut state) % 300) as u32;
+            if model.insert(key, person).is_none() {
+                links.insert(key, person);
+            }
+        }
+        // Present keys, absent keys, and keys sharing a first hash with a present one.
+        let mut keys: Vec<(u64, u64)> = model.keys().copied().collect();
+        keys.extend((0..3_000).map(|_| (next(&mut state) << 20 | next(&mut state), next(&mut state))));
+        keys.extend(model.keys().take(500).map(|&(a, b)| (a, b ^ 1)));
+        for chunk in keys.chunks(BATCH) {
+            let mut found = [None; BATCH];
+            links.resolve_batch(chunk, &mut found);
+            for (key, slot) in chunk.iter().zip(found) {
+                let expected = model.get(key).copied();
+                assert_eq!(slot.map(|slot| slot.person()), expected);
+                if let Some(slot) = slot {
+                    assert_eq!(slot.target, (u64::from(slot.person()) * 7, u64::from(slot.person()) * 13));
+                }
+            }
+        }
     }
 
     #[test]
