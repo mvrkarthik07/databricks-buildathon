@@ -433,6 +433,32 @@ fn index_chunks<'a>(
     Ok((table, indexed))
 }
 
+/// Worker `w` takes buckets `w * per_worker ..` of `by_bucket`.
+fn split_by_worker<T>(by_bucket: Vec<Vec<Vec<T>>>, buckets: Buckets) -> Vec<Vec<Vec<Vec<T>>>> {
+    let mut by_bucket = by_bucket.into_iter();
+    (0..buckets.workers).map(|_| by_bucket.by_ref().take(buckets.per_worker).collect()).collect()
+}
+
+/// Like `parallel`, but each worker gets its whole lane of jobs at once, so it can keep state
+/// across them.
+fn parallel_lanes<T: Send, U: Send>(jobs: Vec<T>, workers: usize, run: impl Fn(Vec<T>) -> U + Sync) -> Vec<U> {
+    let mut lanes: Vec<Vec<T>> = (0..workers).map(|_| Vec::new()).collect();
+    for (i, job) in jobs.into_iter().enumerate() {
+        lanes[i % workers].push(job);
+    }
+    thread::scope(|scope| {
+        let run = &run;
+        let mut lanes = lanes.into_iter();
+        let local = lanes.next().unwrap();
+        let handles: Vec<_> = lanes.filter(|lane| !lane.is_empty()).map(|lane| scope.spawn(move || run(lane))).collect();
+        let mut results = vec![run(local)];
+        for handle in handles {
+            results.push(handle.join().unwrap());
+        }
+        results
+    })
+}
+
 fn parallel<T: Send, U: Send>(jobs: Vec<T>, workers: usize, run: impl Fn(T) -> U + Sync) -> Vec<U> {
     let mut lanes: Vec<Vec<T>> = (0..workers).map(|_| Vec::new()).collect();
     for (i, job) in jobs.into_iter().enumerate() {
@@ -578,6 +604,37 @@ fn worker_of(hash: u64, workers: usize) -> usize {
     (((hash >> 32) * workers as u64) >> 32) as usize
 }
 
+/// Events per bucket the aggregation aims for: small enough that a bucket's people table, grouped
+/// events and sort all stay in cache. `SS_BUCKET_EVENTS` overrides it (tests use tiny buckets).
+fn bucket_events() -> usize {
+    env::var("SS_BUCKET_EVENTS").ok().and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(16_384)
+}
+
+/// Where a person's events and clicks go: each worker owns `per_worker` consecutive buckets, and a
+/// person's identity hashes pick the worker and then the bucket. A worker aggregates its buckets one
+/// after another, so interning, grouping and sorting work on a cache-sized slice of its people.
+#[derive(Clone, Copy)]
+struct Buckets {
+    workers: usize,
+    per_worker: usize,
+}
+
+impl Buckets {
+    fn new(events: usize, workers: usize) -> Self {
+        let per_worker = (events / workers).div_ceil(bucket_events()).clamp(1, 4096 / workers);
+        Self { workers, per_worker }
+    }
+
+    fn count(self) -> usize {
+        self.workers * self.per_worker
+    }
+
+    #[inline]
+    fn of(self, hash: u64, hash2: u64) -> usize {
+        worker_of(hash, self.workers) * self.per_worker + (((hash2 >> 32) * self.per_worker as u64) >> 32) as usize
+    }
+}
+
 /// `L` is a profiling ladder: each level stops after one more operation per row (0 only counts
 /// lines, 1 splits, 2 adds the event-ID hash, 3 the user hashes, 4 both timestamps, 5 validation,
 /// 6 and above the full row push). Levels below 6 return empty shards and exist only to measure
@@ -703,8 +760,9 @@ fn dedup_events<'a>(
     batches: Vec<Vec<Row>>,
     people: &Links<'a>,
     chunks: &[Text<'a>],
-    workers: usize,
-) -> Vec<Vec<NamedEvent>> {
+    buckets: Buckets,
+    routed: &mut Vec<Vec<NamedEvent>>,
+) {
     let total: usize = batches.iter().map(Vec::len).sum();
     let mut t = prof::now();
     let sys0 = prof::thread_sys();
@@ -756,8 +814,7 @@ fn dedup_events<'a>(
     prof::split(&mut flagged, &mut t);
     prof::add_ns(prof::DEDUP_WINNER, flagged);
 
-    let share = total / workers + total / workers / 8 + 16;
-    let mut routed: Vec<Vec<NamedEvent>> = (0..workers).map(|_| Vec::with_capacity(share)).collect();
+    let survivors_before: usize = routed.iter().map(Vec::len).sum();
     let mut linked_events = 0u64;
     let mut pending: Vec<&Row> = Vec::with_capacity(BATCH);
     let mut route_pending = |pending: &mut Vec<&Row>, routed: &mut Vec<Vec<NamedEvent>>| {
@@ -775,7 +832,7 @@ fn dedup_events<'a>(
                 }
                 None => (NameRef::line(row.line), row.user_hash, row.user_hash2),
             };
-            routed[worker_of(hash, workers)].push(NamedEvent {
+            routed[buckets.of(hash, hash2)].push(NamedEvent {
                 name,
                 hash,
                 hash2,
@@ -787,18 +844,17 @@ fn dedup_events<'a>(
         for (row, _) in batch.iter().zip(winner).filter(|&(row, &win)| win && row.category != INVALID) {
             pending.push(row);
             if pending.len() == BATCH {
-                route_pending(&mut pending, &mut routed);
+                route_pending(&mut pending, routed);
             }
         }
     }
-    route_pending(&mut pending, &mut routed);
+    route_pending(&mut pending, routed);
     let mut routed_ns = 0u64;
     prof::split(&mut routed_ns, &mut t);
     prof::add_ns(prof::DEDUP_ROUTE, routed_ns);
     prof::add_sys(prof::S_DEDUP, sys0);
     prof::add_ns(prof::C_LINKED_EVENTS, linked_events);
-    prof::add_ns(prof::C_SURVIVORS, routed.iter().map(|r| r.len() as u64).sum());
-    routed
+    prof::add_ns(prof::C_SURVIVORS, (routed.iter().map(Vec::len).sum::<usize>() - survivors_before) as u64);
 }
 
 struct PendingClick<'a> {
@@ -812,11 +868,11 @@ fn route_clicks<'a>(
     catalog: &Catalog<'a>,
     start: i64,
     end: i64,
-    workers: usize,
+    buckets: Buckets,
 ) -> Vec<Vec<NamedClick<'a>>> {
     let t0 = prof::now();
     let sys0 = prof::thread_sys();
-    let mut routed: Vec<Vec<NamedClick>> = (0..workers).map(|_| Vec::new()).collect();
+    let mut routed: Vec<Vec<NamedClick>> = (0..buckets.count()).map(|_| Vec::new()).collect();
     let mut dates = Dates::new();
     let mut pending: Vec<PendingClick> = Vec::with_capacity(BATCH);
     let route_pending = |pending: &mut Vec<PendingClick<'a>>, routed: &mut Vec<Vec<NamedClick<'a>>>| {
@@ -828,7 +884,7 @@ fn route_clicks<'a>(
         people.resolve_batch(&keys[..pending.len()], &mut found);
         for (p, slot) in pending.drain(..).zip(found) {
             let (hash, hash2) = slot.map_or(p.user, |slot| slot.target);
-            routed[worker_of(hash, workers)].push(NamedClick { hash, hash2, click: p.click });
+            routed[buckets.of(hash, hash2)].push(NamedClick { hash, hash2, click: p.click });
         }
     };
     for chunk in chunks.iter().take(2) {
@@ -1021,30 +1077,15 @@ struct Accum<'a> {
     active: Active,
 }
 
-/// Events per bucket the aggregation aims for: small enough that a bucket's people table, grouped
-/// events and sort all stay in cache. `SS_BUCKET_EVENTS` overrides it (tests use tiny buckets).
-fn bucket_events() -> usize {
-    env::var("SS_BUCKET_EVENTS").ok().and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(16_384)
-}
-
-#[inline]
-fn bucket_of(hash2: u64, buckets: usize) -> usize {
-    (((hash2 >> 32) * buckets as u64) >> 32) as usize
-}
-
-/// Splits a worker's people into buckets by their identity hash, so every person's events and
-/// clicks land in one bucket, and aggregates the buckets one after another. Interning, grouping and
-/// sorting then work on a cache-sized slice instead of the worker's whole share.
+/// Aggregates the buckets of one worker, one after another.
 fn aggregate<'a>(
-    event_batches: Vec<Vec<NamedEvent>>,
-    click_batches: Vec<Vec<NamedClick<'a>>>,
+    event_buckets: Vec<Vec<Vec<NamedEvent>>>,
+    click_buckets: Vec<Vec<Vec<NamedClick<'a>>>>,
     catalog: &Catalog<'a>,
     (first_day, last_day): (i32, i32),
     chunks: &[Text<'a>],
     links: &Links<'a>,
 ) -> (Vec<UserRow<'a>>, DailyTotals) {
-    let events: usize = event_batches.iter().map(Vec::len).sum();
-    let clicks: usize = click_batches.iter().map(Vec::len).sum();
     let campaign_count = catalog.campaigns.names.len();
     let mut acc = Accum {
         users: Vec::new(),
@@ -1053,29 +1094,8 @@ fn aggregate<'a>(
         touched: Vec::new(),
         active: Active::new(campaign_count),
     };
-    let buckets = events.div_ceil(bucket_events()).clamp(1, 4096);
-    if buckets == 1 {
-        aggregate_part(event_batches, click_batches, catalog, chunks, links, &mut acc);
-    } else {
-        let t = prof::now();
-        let mut event_buckets: Vec<Vec<NamedEvent>> =
-            (0..buckets).map(|_| Vec::with_capacity(events / buckets * 5 / 4 + 16)).collect();
-        for batch in event_batches {
-            for event in &batch {
-                event_buckets[bucket_of(event.hash2, buckets)].push(*event);
-            }
-        }
-        let mut click_buckets: Vec<Vec<NamedClick<'a>>> =
-            (0..buckets).map(|_| Vec::with_capacity(clicks / buckets * 5 / 4 + 16)).collect();
-        for batch in click_batches {
-            for click in &batch {
-                click_buckets[bucket_of(click.hash2, buckets)].push(*click);
-            }
-        }
-        prof::add(prof::AGG_PARTITION, t);
-        for (events, clicks) in event_buckets.into_iter().zip(click_buckets) {
-            aggregate_part(vec![events], vec![clicks], catalog, chunks, links, &mut acc);
-        }
+    for (events, clicks) in event_buckets.into_iter().zip(click_buckets) {
+        aggregate_part(events, clicks, catalog, chunks, links, &mut acc);
     }
     (acc.users, acc.campaigns)
 }
@@ -1342,12 +1362,20 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
         (people.join().unwrap(), copies)
     });
     lap("links+route");
-    let events = parallel(transpose(copies, shards), workers, |batches| {
-        dedup_events(batches, &people, &event_chunks, workers)
+    let rows: usize = copies.iter().flatten().map(Vec::len).sum();
+    let buckets = Buckets::new(rows, workers);
+    // Each worker keeps its own bucket vectors across all the shards it dedups.
+    let capacity = rows / workers / buckets.count() * 5 / 4 + 16;
+    let events = parallel_lanes(transpose(copies, shards), workers, |lane| {
+        let mut routed: Vec<Vec<NamedEvent>> = (0..buckets.count()).map(|_| Vec::with_capacity(capacity)).collect();
+        for batches in lane {
+            dedup_events(batches, &people, &event_chunks, buckets, &mut routed);
+        }
+        routed
     });
     lap("dedup");
     let clicks = parallel(chunk_batches(&click_files, workers), workers, |chunks| {
-        route_clicks(chunks, &people, &catalog, start, end, workers)
+        route_clicks(chunks, &people, &catalog, start, end, buckets)
     });
     lap("clicks");
 
@@ -1355,9 +1383,9 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
     let campaign_folder = out.join("campaign_daily");
     fs::create_dir_all(&user_folder)?;
     fs::create_dir_all(&campaign_folder)?;
-    let jobs = transpose(events, workers)
+    let jobs = split_by_worker(transpose(events, buckets.count()), buckets)
         .into_iter()
-        .zip(transpose(clicks, workers))
+        .zip(split_by_worker(transpose(clicks, buckets.count()), buckets))
         .enumerate()
         .collect();
     // Event timestamps are inside the window, so session days are too.
