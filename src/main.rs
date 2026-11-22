@@ -989,7 +989,15 @@ fn group_by_person<T: Copy + Default>(
     }
     let mut next = start[..people].to_vec();
     let mut grouped = vec![T::default(); count];
+    // Each item lands at a random spot of a table far bigger than the cache, so the spot of the item
+    // `AHEAD` places on is requested early. `next` may still move before then; a stale guess only
+    // wastes the prefetch.
+    const AHEAD: usize = 12;
+    let mut lookahead = items.clone().skip(AHEAD);
     for (person, item) in items {
+        if let Some((later, _)) = lookahead.next() {
+            prefetch(&grouped[(next[later as usize] as usize).min(count - 1)]);
+        }
         let slot = &mut next[person as usize];
         grouped[*slot as usize] = item;
         *slot += 1;
