@@ -12,6 +12,7 @@
 //! fails the allocation fails with null, exactly as the system allocator would when out of memory.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 
 const HUGE: usize = 2 << 20;
@@ -21,12 +22,31 @@ const BIG: usize = 4 * HUGE;
 // experiment: threshold overridable with SS_BIG (bytes), read once in `init` before any big block exists
 static THRESHOLD: AtomicUsize = AtomicUsize::new(BIG);
 
+// Mid-size blocks (MID_MIN up to 8 MiB) come from huge-page regions and are recycled by size, so a
+// 0.5 MB route shard costs neither a 2 MiB mapping of its own nor 4 KiB page faults. Experiment: off
+// unless SS_MID=<bytes> sets the smallest size served this way.
+const UNIT: usize = 64 << 10;
+const MAX_UNITS: usize = 128;
+const REGION: usize = 64 << 20;
+static MID_MIN: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+struct Mid {
+    /// Head of the free list for blocks of `n` units, 0 when empty; a free block's first word links to the next.
+    free: [usize; MAX_UNITS + 1],
+    cur: usize,
+    end: usize,
+}
+static MID: Mutex<Mid> = Mutex::new(Mid { free: [0; MAX_UNITS + 1], cur: 0, end: 0 });
+
 static ADVISE: AtomicBool = AtomicBool::new(true);
 
 /// Call first thing in `main`: `SS_THP=0` turns the huge-page hint off.
 pub fn init() {
     if std::env::var_os("SS_THP").is_some_and(|v| v == "0") {
         ADVISE.store(false, Relaxed);
+    }
+    if let Some(n) = std::env::var("SS_MID").ok().and_then(|v| v.parse::<usize>().ok()) {
+        MID_MIN.store(n, Relaxed);
     }
     if let Some(n) = std::env::var("SS_BIG").ok().and_then(|v| v.parse::<usize>().ok()) {
         THRESHOLD.store(n, Relaxed);
@@ -40,8 +60,67 @@ fn is_big(layout: &Layout) -> bool {
     layout.size() >= THRESHOLD.load(Relaxed) && layout.align() <= PAGE
 }
 
+#[inline]
+fn is_mid(layout: &Layout) -> bool {
+    !is_big(layout)
+        && layout.size() >= MID_MIN.load(Relaxed)
+        && layout.size() <= MAX_UNITS * UNIT
+        && layout.align() <= PAGE
+}
+
+/// A block of `size` bytes from the mid-size pool; zeroed when `zero`.
+unsafe fn mid_alloc(size: usize, zero: bool) -> *mut u8 {
+    let units = size.div_ceil(UNIT);
+    let mut mid = MID.lock().unwrap_or_else(|e| e.into_inner());
+    let head = mid.free[units];
+    if head != 0 {
+        mid.free[units] = unsafe { *(head as *const usize) };
+        drop(mid);
+        if zero {
+            unsafe { std::ptr::write_bytes(head as *mut u8, 0, size) };
+        }
+        return head as *mut u8;
+    }
+    let bytes = units * UNIT;
+    if mid.end - mid.cur < bytes {
+        // The rest of the old region (under 8 MiB, mostly never touched) is given up.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                REGION + HUGE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return std::ptr::null_mut();
+        }
+        let start = (base as usize + HUGE - 1) & !(HUGE - 1);
+        if ADVISE.load(Relaxed) {
+            unsafe { libc::madvise(start as *mut _, REGION, libc::MADV_HUGEPAGE) };
+        }
+        mid.cur = start;
+        mid.end = start + REGION;
+    }
+    let block = mid.cur;
+    mid.cur += bytes;
+    block as *mut u8 // fresh mapping: already zero
+}
+
+unsafe fn mid_free(ptr: *mut u8, size: usize) {
+    let units = size.div_ceil(UNIT);
+    let mut mid = MID.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { *(ptr as *mut usize) = mid.free[units] };
+    mid.free[units] = ptr as usize;
+}
+
 unsafe impl GlobalAlloc for Alloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if is_mid(&layout) {
+            return unsafe { mid_alloc(layout.size(), false) };
+        }
         if !is_big(&layout) {
             return unsafe { System.alloc(layout) };
         }
@@ -74,7 +153,9 @@ unsafe impl GlobalAlloc for Alloc {
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        if is_big(&layout) {
+        if is_mid(&layout) {
+            unsafe { mid_alloc(layout.size(), true) }
+        } else if is_big(&layout) {
             // A fresh anonymous mapping is already zero.
             unsafe { self.alloc(layout) }
         } else {
@@ -83,6 +164,9 @@ unsafe impl GlobalAlloc for Alloc {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if is_mid(&layout) {
+            return unsafe { mid_free(ptr, layout.size()) };
+        }
         if !is_big(&layout) {
             return unsafe { System.dealloc(ptr, layout) };
         }
@@ -146,6 +230,25 @@ mod tests {
                 }
             }
             Alloc.dealloc(p, layout);
+        }
+    }
+
+    #[test]
+    fn mid_blocks_are_recycled_and_zeroed_on_request() {
+        // Calls the pool directly: flipping MID_MIN would race with the other tests' allocations.
+        let size = 3 * UNIT - 5;
+        unsafe {
+            let a = mid_alloc(size, true);
+            assert!(!a.is_null());
+            assert_eq!(a as usize % UNIT, 0);
+            std::ptr::write_bytes(a, 0xAB, size);
+            mid_free(a, size);
+            let b = mid_alloc(size, true);
+            assert!(std::slice::from_raw_parts(b, size).iter().all(|&x| x == 0));
+            let c = mid_alloc(size, false);
+            assert_ne!(b, c);
+            mid_free(b, size);
+            mid_free(c, size);
         }
     }
 

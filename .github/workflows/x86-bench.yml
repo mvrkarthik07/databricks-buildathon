@@ -186,6 +186,8 @@ jobs:
           done
           generator/target/release/generate --seed 20261003 --events "${{ inputs.events }}" \
             --clicks $(( ${{ inputs.events }} / 4 )) --output /tmp/data
+      - name: Unit tests
+        run: cargo test --release --locked 2>&1 | grep -E "test result|FAILED|panicked"
       - name: Output equality with the base for every variant
         run: |
           /tmp/base /tmp/data /tmp/out-base
