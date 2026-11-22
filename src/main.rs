@@ -1,5 +1,6 @@
 mod input;
 mod output;
+mod v2;
 
 use std::cmp::{Reverse, min};
 use std::env;
@@ -1087,7 +1088,13 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
     let (event_chunks, event_batches) = index_chunks(chunk_batches(&event_files, workers))?;
     let link_rows = parallel(chunk_batches(&links, workers), workers, parse_links);
     lap("link parse");
-    let (people, copies) = thread::scope(|scope| {
+    // `SS_ENGINE=v2` selects the packed-row engine (src/v2.rs); the generic engine below is also
+    // its fallback for input the fast path does not cover.
+    let use_v2 = env::var("SS_ENGINE").is_ok_and(|e| e == "v2");
+    let backup = use_v2.then(|| event_batches.clone());
+    let irregular = std::sync::atomic::AtomicBool::new(false);
+    let shards = dedup_shards();
+    let (people, lanes, copies) = thread::scope(|scope| {
         let people = scope.spawn(|| {
             let t = std::time::Instant::now();
             let people = build_links(link_rows);
@@ -1096,15 +1103,36 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
             }
             people
         });
-        let copies = parallel(event_batches, workers, |chunks| {
-            route_rows(chunks, &catalog, start, end)
-        });
-        (people.join().unwrap(), copies)
+        let (mut lanes, mut copies) = (None, None);
+        if use_v2 {
+            lanes = Some(parallel(event_batches.into_iter().enumerate().collect(), workers, |(i, chunks)| {
+                v2::parse_pack(i as u32, chunks, &catalog, (start, end), shards, &irregular)
+            }));
+        } else {
+            copies = Some(parallel(event_batches, workers, |chunks| route_rows(chunks, &catalog, start, end)));
+        }
+        (people.join().unwrap(), lanes, copies)
     });
     lap("links+route");
-    let events = parallel(transpose(copies, dedup_shards()), workers, |batches| {
-        dedup_events(batches, &people, &event_chunks, workers)
-    });
+    let v1 = |copies| {
+        parallel(transpose(copies, dedup_shards()), workers, |batches| {
+            dedup_events(batches, &people, &event_chunks, workers)
+        })
+    };
+    let events = match (lanes, copies) {
+        (Some(lanes), _) if !irregular.load(std::sync::atomic::Ordering::Relaxed) => {
+            let flags = v2::dedup_all(&lanes, &event_chunks, workers);
+            lap("v2 dedup");
+            let jobs: Vec<_> = lanes.iter().zip(&flags).collect();
+            parallel(jobs, workers, |(lane, flags)| v2::resolve_route(lane, flags, &people, workers))
+        }
+        (Some(_), _) => {
+            let backup = backup.expect("v2 keeps the batches for its fallback");
+            v1(parallel(backup, workers, |chunks| route_rows(chunks, &catalog, start, end)))
+        }
+        (None, Some(copies)) => v1(copies),
+        (None, None) => unreachable!(),
+    };
     lap("dedup");
     let clicks = parallel(chunk_batches(&click_files, workers), workers, |chunks| {
         route_clicks(chunks, &people, &catalog, start, end, workers)

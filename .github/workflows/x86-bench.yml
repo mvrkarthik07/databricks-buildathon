@@ -11,7 +11,7 @@ on:
         description: "Events in the generated dataset"
         default: "20000000"
       only_micro:
-        description: "true: skip base build, tests and A/B; run only the route_rows shard microbenchmark"
+        description: "false: full A/B vs base. true: only the route_rows shard microbenchmark. engine: v1 vs v2 engine comparison (SS_ENGINE)"
         default: "false"
 
 jobs:
@@ -38,7 +38,7 @@ jobs:
           fi
           (cd generator && cargo build --release)
       - name: Unit tests, adversarial fixtures, Python oracle on fresh seeds
-        if: ${{ inputs.only_micro != 'true' }}
+        if: ${{ inputs.only_micro == 'false' }}
         # The 36 published fixtures sit in the git-ignored starter-duckdb/, so they are checked locally only.
         run: |
           cargo test --release --locked
@@ -55,28 +55,28 @@ jobs:
           generator/target/release/generate --seed 20261003 --events "${{ inputs.events }}" \
             --clicks $(( ${{ inputs.events }} / 4 )) --output /tmp/data
       - name: Output matches the base build
-        if: ${{ inputs.only_micro != 'true' }}
+        if: ${{ inputs.only_micro == 'false' }}
         run: |
           /tmp/base /tmp/data /tmp/out-base
           /tmp/new /tmp/data /tmp/out-new
           python3 tools/diff.py /tmp/out-new /tmp/out-base | tail -3
       - name: Per-stage wall-clock laps of the current build (cumulative, last of 3 runs)
-        if: ${{ inputs.only_micro != 'true' }}
+        if: ${{ inputs.only_micro == 'false' }}
         run: |
           for i in 1 2 3; do rm -rf /tmp/out-lap; NCPU=$(nproc) SS_TIMING=1 /tmp/new /tmp/data /tmp/out-lap 2> /tmp/laps.txt; done
           cat /tmp/laps.txt
           NCPU=$(nproc) /usr/bin/time -v /tmp/new /tmp/data /tmp/out-rss 2>&1 | grep -E "Maximum resident|Elapsed|Minor|Major" || true
       - name: Single-thread parse microbenchmark (ns per row, per component)
-        if: ${{ inputs.only_micro != 'true' }}
+        if: ${{ inputs.only_micro == 'false' }}
         run: SS_BENCH=1 /tmp/new /tmp/data /tmp/out-bench 2>&1 | tail -12
       - name: Adaptive shards vs the scored count (output must match the base build)
-        if: ${{ inputs.only_micro != 'true' }}
+        if: ${{ inputs.only_micro == 'false' }}
         run: |
           printf '#!/bin/sh\nSS_SHARDS=64 exec /tmp/new "$@"\n' > /tmp/new-s64; chmod +x /tmp/new-s64
           rm -rf /tmp/out-a; /tmp/new /tmp/data /tmp/out-a; python3 tools/diff.py /tmp/out-a /tmp/out-base | tail -1 | sed 's/^/adaptive: /'
           NCPU=$(nproc) python3 tools/ab.py /tmp/data 15 /tmp/new-s64 /tmp/new
       - name: Interleaved timing against the base build
-        if: ${{ inputs.only_micro != 'true' }}
+        if: ${{ inputs.only_micro == 'false' }}
         run: |
           NCPU=$(nproc) python3 tools/ab.py /tmp/data 15 /tmp/base /tmp/new
       - name: route_rows ns/row by shard count (single thread)
@@ -93,3 +93,57 @@ jobs:
           PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1); PERF=${PERF:-perf}; echo "perf: $PERF"
           NCPU=4 sudo -E $PERF record -F 1999 -e cpu-clock -o /tmp/perf.data /tmp/new /tmp/data /tmp/o-perf 2>&1 | tail -2
           sudo $PERF report -i /tmp/perf.data --no-children --sort sym --stdio 2>/dev/null | grep -v "^#" | grep -v "^$" | head -45 | cut -c1-150
+
+      # ---- only_micro=engine: the v2 engine (src/v2.rs) against the generic engine, same binary ----
+      - name: "engine: correctness of v2 (unit tests, adversarial, oracle seeds, worker counts)"
+        if: ${{ inputs.only_micro == 'engine' }}
+        run: |
+          export SS_ENGINE=v2
+          cargo test --release --locked
+          make check-adversarial PYTHON=python3 REF=/tmp/new
+          for seed in 11 22 33 44; do
+            generator/target/release/generate --seed $seed --events 200000 --clicks 50000 --output /tmp/small$seed
+            python3 ref/reference.py /tmp/small$seed /tmp/oracle$seed > /dev/null
+            for n in 1 2 3 4 8; do
+              rm -rf /tmp/new$seed; NCPU=$n /tmp/new /tmp/small$seed /tmp/new$seed
+              python3 tools/diff.py /tmp/new$seed /tmp/oracle$seed | grep -q '^MATCH' && echo "seed $seed NCPU=$n: MATCH" || { echo "seed $seed NCPU=$n: DIFFERENT"; exit 1; }
+            done
+          done
+      - name: "engine: extra seeds, v2 output must equal the generic engine's"
+        if: ${{ inputs.only_micro == 'engine' }}
+        run: |
+          for seed in 7 99; do
+            generator/target/release/generate --seed $seed --events 10000000 --clicks 2500000 --output /tmp/x$seed
+            rm -rf /tmp/o1 /tmp/o2; SS_ENGINE=v1 /tmp/new /tmp/x$seed /tmp/o1; SS_ENGINE=v2 /tmp/new /tmp/x$seed /tmp/o2
+            python3 tools/diff.py /tmp/o2 /tmp/o1 | tail -1 | sed "s/^/seed $seed v2 vs v1: /"
+            python3 tools/diff.py /tmp/o2 /tmp/o1 | grep -q '^MATCH'
+          done
+          rm -rf /tmp/o1 /tmp/o2; SS_ENGINE=v2 /tmp/new /tmp/data /tmp/o2; /tmp/base /tmp/data /tmp/o1
+          python3 tools/diff.py /tmp/o2 /tmp/o1 | tail -1 | sed "s/^/20M v2 vs scored build: /"
+          python3 tools/diff.py /tmp/o2 /tmp/o1 | grep -q '^MATCH'
+      - name: "engine: stage laps and thread-ms, v1 then v2 (last of 3)"
+        if: ${{ inputs.only_micro == 'engine' }}
+        run: |
+          for e in v1 v2; do
+            for i in 1 2 3; do rm -rf /tmp/out-lap; NCPU=$(nproc) SS_ENGINE=$e SS_TIMING=1 /tmp/new /tmp/data /tmp/out-lap 2> /tmp/laps-$e.txt; done
+            echo "== $e"; cat /tmp/laps-$e.txt
+            NCPU=$(nproc) SS_ENGINE=$e /usr/bin/time -v /tmp/new /tmp/data /tmp/out-rss 2>&1 | grep -E "Maximum resident|Elapsed|Minor|Voluntary|Involuntary" || true
+          done
+      - name: "engine: hardware counters (cycles, instructions, cache misses) if the VM exposes them"
+        if: ${{ inputs.only_micro == 'engine' }}
+        run: |
+          sudo apt-get install -y -q linux-tools-common linux-tools-$(uname -r) > /dev/null 2>&1 || sudo apt-get install -y -q linux-tools-generic > /dev/null 2>&1 || true
+          sudo sysctl -q kernel.perf_event_paranoid=-1 || true
+          PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1); PERF=${PERF:-perf}
+          for e in v1 v2; do
+            echo "== $e"; NCPU=$(nproc) SS_ENGINE=$e sudo -E $PERF stat -e task-clock,cycles,instructions,cache-misses,cache-references,page-faults /tmp/new /tmp/data /tmp/o-perf 2>&1 | grep -E "task-clock|cycles|instructions|cache|page-faults|not supported|elapsed" || true
+          done
+      - name: "engine: interleaved A/B (scored build, generic engine, v2), 20M events"
+        if: ${{ inputs.only_micro == 'engine' }}
+        run: |
+          printf '#!/bin/sh\nSS_ENGINE=v1 exec /tmp/new "$@"\n' > /tmp/new-v1; printf '#!/bin/sh\nSS_ENGINE=v2 exec /tmp/new "$@"\n' > /tmp/new-v2; chmod +x /tmp/new-v1 /tmp/new-v2
+          NCPU=$(nproc) python3 tools/ab.py /tmp/data 15 /tmp/base /tmp/new-v1 /tmp/new-v2
+      - name: "engine: interleaved A/B on the extra seeds"
+        if: ${{ inputs.only_micro == 'engine' }}
+        run: |
+          for seed in 7 99; do echo "== seed $seed (10M)"; NCPU=$(nproc) python3 tools/ab.py /tmp/x$seed 11 /tmp/new-v1 /tmp/new-v2; done
