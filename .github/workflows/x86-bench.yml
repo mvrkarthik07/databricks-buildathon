@@ -147,6 +147,14 @@ jobs:
               echo "click ladder $c round $round: $(NCPU=1 SS_CLADDER=$c /tmp/prof /tmp/data /tmp/o 2>&1 | grep -E 'PROF route_clicks' )"
             done
           done
+      - name: Dedup insert with and without the cold input reads (NOCOLD gives wrong output), one thread
+        run: |
+          for round in 1 2 3; do
+            for v in 99 1; do
+              rm -rf /tmp/o; mkdir /tmp/o
+              echo "SS_NOCOLD=$v round $round: $(NCPU=1 SS_NOCOLD=$v /tmp/prof /tmp/data /tmp/o 2>&1 | grep -E 'dedup: table insert' )"
+            done
+          done
       - name: Full pipeline, per-phase thread time (NCPU = cores)
         run: |
           for round in 1 2 3; do

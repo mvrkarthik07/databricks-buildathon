@@ -694,6 +694,8 @@ fn dedup_events<'a>(
     let mut t = prof::now();
     let sys0 = prof::thread_sys();
     let (mut pairs, mut compares) = (0u64, 0u64);
+    // Profiling only: treat equal hashes as equal IDs and never read the input back (wrong output).
+    let no_cold = ladder_level("SS_NOCOLD") == 1;
     let mut kept: HashTable<Slot> = HashTable::with_capacity(total);
     for (b, batch) in batches.iter().enumerate() {
         for (p, row) in batch.iter().enumerate() {
@@ -707,8 +709,9 @@ fn dedup_events<'a>(
                 |old| {
                     old.hash == row.hash && {
                         compares += 1;
-                        cold_field(chunks, batches[old.batch as usize][old.pos as usize].line, 0)
-                            == cold_field(chunks, row.line, 0)
+                        no_cold
+                            || cold_field(chunks, batches[old.batch as usize][old.pos as usize].line, 0)
+                                == cold_field(chunks, row.line, 0)
                     }
                 },
                 |slot| slot.hash,
@@ -719,7 +722,7 @@ fn dedup_events<'a>(
                 Entry::Occupied(mut entry) => {
                     pairs += 1;
                     let old = &batches[entry.get().batch as usize][entry.get().pos as usize];
-                    if cold_field(chunks, row.line, 3) < cold_field(chunks, old.line, 3) {
+                    if !no_cold && cold_field(chunks, row.line, 3) < cold_field(chunks, old.line, 3) {
                         *entry.get_mut() = slot;
                     }
                 }
