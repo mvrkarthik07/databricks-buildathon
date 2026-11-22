@@ -3,6 +3,7 @@ use std::io::BufWriter;
 use std::path::Path;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use parquet::data_type::{ByteArray, ByteArrayType, DataType, Int32Type, Int64Type};
 use parquet::errors::Result;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
@@ -59,6 +60,17 @@ pub struct CampaignRow<'a> {
     pub totals: CampaignTotals,
 }
 
+/// A `ByteArray` that points at `text` instead of copying it (`ByteArray::from(&[u8])` makes two
+/// allocations per value, which was most of the time spent writing names).
+///
+/// The value must be dropped before `text`'s mapping is: it is only ever collected into the batch
+/// that `column` hands to `write_batch`, which copies the bytes into the page and returns.
+fn borrowed(text: Text<'_>) -> ByteArray {
+    // SAFETY: only the lifetime is changed; see above for why the value never outlives `text`.
+    let text: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(text) };
+    ByteArray::from(Bytes::from_static(text))
+}
+
 type Sink = BufWriter<File>;
 
 fn open(path: &Path, schema: &str) -> Result<SerializedFileWriter<Sink>> {
@@ -90,7 +102,7 @@ pub fn users(path: &Path, rows: &[UserRow<'_>]) -> Result<()> {
         let mut group = file.next_row_group()?;
         column::<ByteArrayType>(
             &mut group,
-            rows.iter().map(|row| ByteArray::from(row.name)),
+            rows.iter().map(|row| borrowed(row.name)),
             None,
         )?;
         column::<Int32Type>(&mut group, rows.iter().map(|row| row.day), None)?;
@@ -101,7 +113,7 @@ pub fn users(path: &Path, rows: &[UserRow<'_>]) -> Result<()> {
             .iter()
             .map(|row| i16::from(row.top.is_some()))
             .collect();
-        let categories = rows.iter().filter_map(|row| row.top.map(ByteArray::from));
+        let categories = rows.iter().filter_map(|row| row.top.map(borrowed));
         column::<ByteArrayType>(&mut group, categories, Some(&levels))?;
         group.close()?;
     }
@@ -115,12 +127,12 @@ pub fn campaigns(path: &Path, rows: &[CampaignRow<'_>]) -> Result<()> {
         let mut group = file.next_row_group()?;
         column::<ByteArrayType>(
             &mut group,
-            rows.iter().map(|row| ByteArray::from(row.id)),
+            rows.iter().map(|row| borrowed(row.id)),
             None,
         )?;
         column::<ByteArrayType>(
             &mut group,
-            rows.iter().map(|row| ByteArray::from(row.channel)),
+            rows.iter().map(|row| borrowed(row.channel)),
             None,
         )?;
         column::<Int32Type>(&mut group, rows.iter().map(|row| row.day), None)?;
