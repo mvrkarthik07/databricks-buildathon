@@ -7,6 +7,7 @@ use std::time::Instant;
 
 pub const ROUTE: usize = 0;
 pub const DEDUP_INSERT: usize = 1;
+#[allow(dead_code)] // report slot kept so indices stay stable
 pub const DEDUP_WINNER: usize = 2;
 pub const DEDUP_ROUTE: usize = 3;
 pub const CLICKS: usize = 4;
@@ -25,6 +26,7 @@ pub const BUILD_LINKS: usize = 16;
 // Counters (not times).
 pub const C_ROWS: usize = 17;
 pub const C_DUP_PAIRS: usize = 18;
+#[allow(dead_code)] // report slot kept so indices stay stable
 pub const C_KEY_COMPARES: usize = 19;
 pub const C_SURVIVORS: usize = 20;
 pub const C_PEOPLE: usize = 21;
