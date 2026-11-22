@@ -504,6 +504,7 @@ fn route_rows<'a, const L: u32>(
     shard_count: usize,
 ) -> Vec<Vec<Row>> {
     let t0 = prof::now();
+    let sys0 = prof::thread_sys();
     let lines: usize = chunks.iter().map(|(_, chunk)| memchr::memchr_iter(b'\n', chunk).count()).sum();
     if L == 0 {
         std::hint::black_box(lines);
@@ -599,6 +600,7 @@ fn route_rows<'a, const L: u32>(
     }
     std::hint::black_box(sink);
     prof::add(prof::ROUTE, t0);
+    prof::add_sys(prof::S_ROUTE, sys0);
     shards
 }
 
@@ -609,7 +611,9 @@ struct Slot {
     pos: u32,
 }
 
-fn dedup_events<'a>(
+/// `DL` is a profiling ladder for the survivor loop: 0 only walks the winner flags, 1 adds the
+/// link lookup, 2 and above routes the event. The scored build uses 99.
+fn dedup_events<'a, const DL: u32>(
     batches: Vec<Vec<Row>>,
     people: &Links<'a>,
     chunks: &[Text<'a>],
@@ -617,6 +621,8 @@ fn dedup_events<'a>(
 ) -> Vec<Vec<NamedEvent>> {
     let total: usize = batches.iter().map(Vec::len).sum();
     let mut t = prof::now();
+    let sys0 = prof::thread_sys();
+    let mut sink = 0u64;
     let (mut pairs, mut compares) = (0u64, 0u64);
     let mut kept: HashTable<Slot> = HashTable::with_capacity(total);
     for (b, batch) in batches.iter().enumerate() {
@@ -670,6 +676,10 @@ fn dedup_events<'a>(
     let mut linked_events = 0u64;
     for (batch, winner) in batches.iter().zip(&winner) {
         for (row, _) in batch.iter().zip(winner).filter(|&(row, &win)| win && row.category != INVALID) {
+            if DL == 0 {
+                sink = sink.wrapping_add(row.ts as u64);
+                continue;
+            }
             let (name, hash, hash2) = match people.resolve(row.user_hash, row.user_hash2) {
                 Some(slot) => {
                     linked_events += 1;
@@ -677,6 +687,10 @@ fn dedup_events<'a>(
                 }
                 None => (NameRef::line(row.line), row.user_hash, row.user_hash2),
             };
+            if DL == 1 {
+                sink = sink.wrapping_add(hash ^ hash2 ^ name.0);
+                continue;
+            }
             routed[worker_of(hash, workers)].push(NamedEvent {
                 name,
                 hash,
@@ -692,12 +706,16 @@ fn dedup_events<'a>(
     let mut routed_ns = 0u64;
     prof::split(&mut routed_ns, &mut t);
     prof::add_ns(prof::DEDUP_ROUTE, routed_ns);
+    std::hint::black_box(sink);
+    prof::add_sys(prof::S_DEDUP, sys0);
     prof::add_ns(prof::C_LINKED_EVENTS, linked_events);
     prof::add_ns(prof::C_SURVIVORS, routed.iter().map(|r| r.len() as u64).sum());
     routed
 }
 
-fn route_clicks<'a>(
+/// `CL` is a profiling ladder: 1 splits, 2 adds the campaign lookup, 3 the timestamp, 4 the user
+/// hashes, 5 the link lookup, 6 and above routes the click. The scored build uses 99.
+fn route_clicks<'a, const CL: u32>(
     chunks: Vec<Text<'a>>,
     people: &Links<'a>,
     catalog: &Catalog<'a>,
@@ -706,6 +724,8 @@ fn route_clicks<'a>(
     workers: usize,
 ) -> Vec<Vec<NamedClick<'a>>> {
     let t0 = prof::now();
+    let sys0 = prof::thread_sys();
+    let mut sink = 0u64;
     let mut routed: Vec<Vec<NamedClick>> = (0..workers).map(|_| Vec::new()).collect();
     let mut dates = Dates::new();
     for chunk in chunks.iter().take(2) {
@@ -716,6 +736,10 @@ fn route_clicks<'a>(
             will_need(ahead);
         }
         rows::<4>(chunk, |[id, user, campaign, ts]| {
+        if CL == 1 {
+            sink = sink.wrapping_add((id.len() + user.len() + campaign.len() + ts.len()) as u64);
+            return;
+        }
         if id.is_empty() || user.is_empty() {
             return;
         }
@@ -725,15 +749,31 @@ fn route_clicks<'a>(
         if campaign == catalog.organic {
             return;
         }
+        if CL == 2 {
+            sink = sink.wrapping_add(u64::from(campaign));
+            return;
+        }
         let Some(ts) = timestamp_cached(ts, &mut dates) else { return };
         if ts < start - WEEK || ts >= end {
             return;
         }
+        if CL == 3 {
+            sink = sink.wrapping_add(ts as u64);
+            return;
+        }
         let (user_hash, user_hash2) = (crate::hash(user), self::hash2(user));
+        if CL == 4 {
+            sink = sink.wrapping_add(user_hash ^ user_hash2);
+            return;
+        }
         let (hash, hash2) = match people.resolve(user_hash, user_hash2) {
             Some(slot) => slot.target,
             None => (user_hash, user_hash2),
         };
+        if CL == 5 {
+            sink = sink.wrapping_add(hash ^ hash2);
+            return;
+        }
         routed[worker_of(hash, workers)].push(NamedClick {
             hash,
             hash2,
@@ -745,7 +785,9 @@ fn route_clicks<'a>(
         });
         });
     }
+    std::hint::black_box(sink);
     prof::add(prof::CLICKS, t0);
+    prof::add_sys(prof::S_CLICKS, sys0);
     routed
 }
 
@@ -1067,9 +1109,9 @@ fn flush_daily<'a>(
 }
 
 /// Profiling ladder level from `SS_LADDER` (only with the `prof` feature), else the full pipeline.
-fn ladder_level() -> u32 {
+fn ladder_level(key: &str) -> u32 {
     if cfg!(feature = "prof") {
-        env::var("SS_LADDER").ok().and_then(|s| s.parse().ok()).unwrap_or(99)
+        env::var(key).ok().and_then(|s| s.parse().ok()).unwrap_or(99)
     } else {
         99
     }
@@ -1142,7 +1184,7 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
             }
             people
         });
-        let ladder = ladder_level();
+        let ladder = ladder_level("SS_LADDER");
         let copies = parallel(event_batches, workers, |chunks| match ladder {
             0 => route_rows::<0>(chunks, &catalog, start, end, shards),
             1 => route_rows::<1>(chunks, &catalog, start, end, shards),
@@ -1159,14 +1201,27 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
         (people.join().unwrap(), copies)
     });
     lap("links+route");
-    let events = parallel(transpose(copies, shards), workers, |batches| {
-        dedup_events(batches, &people, &event_chunks, workers)
+    let dedup_ladder = ladder_level("SS_DLADDER");
+    let events = parallel(transpose(copies, shards), workers, |batches| match dedup_ladder {
+        0 => dedup_events::<0>(batches, &people, &event_chunks, workers),
+        1 => dedup_events::<1>(batches, &people, &event_chunks, workers),
+        _ => dedup_events::<99>(batches, &people, &event_chunks, workers),
     });
     lap("dedup");
-    let clicks = parallel(chunk_batches(&click_files, workers), workers, |chunks| {
-        route_clicks(chunks, &people, &catalog, start, end, workers)
+    let click_ladder = ladder_level("SS_CLADDER");
+    let clicks = parallel(chunk_batches(&click_files, workers), workers, |chunks| match click_ladder {
+        1 => route_clicks::<1>(chunks, &people, &catalog, start, end, workers),
+        2 => route_clicks::<2>(chunks, &people, &catalog, start, end, workers),
+        3 => route_clicks::<3>(chunks, &people, &catalog, start, end, workers),
+        4 => route_clicks::<4>(chunks, &people, &catalog, start, end, workers),
+        5 => route_clicks::<5>(chunks, &people, &catalog, start, end, workers),
+        _ => route_clicks::<99>(chunks, &people, &catalog, start, end, workers),
     });
     lap("clicks");
+    if dedup_ladder < 2 || click_ladder < 6 {
+        prof::report();
+        std::process::exit(0);
+    }
 
     let user_folder = out.join("user_daily");
     let campaign_folder = out.join("campaign_daily");
@@ -1183,11 +1238,15 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
         jobs,
         workers,
         |(shard, (events, clicks))| -> Result<DailyTotals> {
+            let sys0 = prof::thread_sys();
             let (users, campaigns) = aggregate(events, clicks, &catalog, days, &event_chunks, &people);
+            prof::add_sys(prof::S_AGG, sys0);
             if shard == 0 || !users.is_empty() {
                 let t0 = prof::now();
+                let sys0 = prof::thread_sys();
                 output::users(&user_folder.join(format!("part-{shard}.parquet")), &users)?;
                 prof::add(prof::WRITE_USERS, t0);
+                prof::add_sys(prof::S_WRITE, sys0);
             }
             Ok(campaigns)
         },

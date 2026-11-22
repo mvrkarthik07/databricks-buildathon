@@ -62,6 +62,39 @@ const NAMES: [&str; 25] = [
 
 static TOTAL: [AtomicU64; 25] = [const { AtomicU64::new(0) }; 25];
 
+/// Per-thread kernel time (microseconds) and minor page faults, by phase.
+pub const S_ROUTE: usize = 0;
+pub const S_DEDUP: usize = 1;
+pub const S_CLICKS: usize = 2;
+pub const S_AGG: usize = 3;
+pub const S_WRITE: usize = 4;
+const SYS_NAMES: [&str; 5] = ["route_rows", "dedup_events", "route_clicks", "aggregate", "parquet users"];
+static SYS_US: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+static FAULTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// This thread's (kernel microseconds, minor faults) so far.
+#[inline(always)]
+pub fn thread_sys() -> (u64, u64) {
+    if !cfg!(feature = "prof") {
+        return (0, 0);
+    }
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    #[cfg(target_os = "linux")]
+    unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut usage) };
+    #[cfg(not(target_os = "linux"))]
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+    (usage.ru_stime.tv_sec as u64 * 1_000_000 + usage.ru_stime.tv_usec as u64, usage.ru_minflt as u64)
+}
+
+#[inline(always)]
+pub fn add_sys(id: usize, start: (u64, u64)) {
+    if cfg!(feature = "prof") {
+        let now = thread_sys();
+        SYS_US[id].fetch_add(now.0 - start.0, Relaxed);
+        FAULTS[id].fetch_add(now.1 - start.1, Relaxed);
+    }
+}
+
 #[inline(always)]
 pub fn now() -> Option<Instant> {
     if cfg!(feature = "prof") { Some(Instant::now()) } else { None }
@@ -94,6 +127,13 @@ pub fn add_ns(id: usize, ns: u64) {
 pub fn report() {
     if !cfg!(feature = "prof") {
         return;
+    }
+    for (id, name) in SYS_NAMES.iter().enumerate() {
+        eprintln!(
+            "PROF sys {name:<20} {:>9.1} thread-ms kernel, {:>9} minor faults",
+            SYS_US[id].load(Relaxed) as f64 / 1e3,
+            FAULTS[id].load(Relaxed)
+        );
     }
     for (id, name) in NAMES.iter().enumerate() {
         let value = TOTAL[id].load(Relaxed);

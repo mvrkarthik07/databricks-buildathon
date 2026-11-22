@@ -129,6 +129,18 @@ jobs:
               echo "ladder $l round $round: $(NCPU=1 SS_LADDER=$l /tmp/prof /tmp/data /tmp/o 2>&1 | grep 'route_rows')"
             done
           done
+      - name: Dedup survivor-routing ladder and click ladder, one thread
+        run: |
+          for round in 1 2; do
+            for d in 0 1 99; do
+              rm -rf /tmp/o; mkdir /tmp/o
+              echo "dedup ladder $d round $round: $(NCPU=1 SS_DLADDER=$d /tmp/prof /tmp/data /tmp/o 2>&1 | grep -E 'PROF dedup: survivor' )"
+            done
+            for c in 1 2 3 4 5 99; do
+              rm -rf /tmp/o; mkdir /tmp/o
+              echo "click ladder $c round $round: $(NCPU=1 SS_CLADDER=$c /tmp/prof /tmp/data /tmp/o 2>&1 | grep -E 'PROF route_clicks' )"
+            done
+          done
       - name: Full pipeline, per-phase thread time (NCPU = cores)
         run: |
           for round in 1 2 3; do
