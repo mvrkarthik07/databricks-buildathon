@@ -372,11 +372,23 @@ fn time_of_day(rest: &[u8], day: i64) -> Option<i64> {
 /// per `lines` item, but with a single scan for all separators.
 #[inline]
 pub fn rows<'a, const N: usize>(bytes: &'a [u8], f: impl FnMut([&'a [u8]; N])) {
+    if bytes.len() > u32::MAX as usize - 1024 {
+        return rows_scalar(bytes, f);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is part of the aarch64 baseline.
+        return unsafe { rows_masked::<N, Neon, _>(bytes, f) };
+    }
     #[cfg(target_arch = "x86_64")]
-    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("popcnt") {
-        // SAFETY: the CPU supports AVX2, checked just above.
+    if std::is_x86_feature_detected!("avx2")
+        && std::is_x86_feature_detected!("bmi1")
+        && std::is_x86_feature_detected!("popcnt")
+    {
+        // SAFETY: the CPU supports AVX2, BMI1 and POPCNT, checked just above.
         return unsafe { rows_avx2(bytes, f) };
     }
+    #[cfg(not(target_arch = "aarch64"))]
     rows_scalar(bytes, f);
 }
 
@@ -408,65 +420,201 @@ fn rows_scalar<'a, const N: usize>(bytes: &'a [u8], mut f: impl FnMut([&'a [u8];
     }
 }
 
+/// Comma, newline and quote bit masks (bit i = byte i) of 64 bytes.
+trait Masker {
+    /// # Safety
+    /// `p` must be readable for 64 bytes and the CPU must support the implementation.
+    unsafe fn masks(p: *const u8) -> [u64; 3];
+}
+
+#[cfg(target_arch = "aarch64")]
+struct Neon;
+
+#[cfg(target_arch = "aarch64")]
+impl Masker for Neon {
+    #[inline(always)]
+    unsafe fn masks(p: *const u8) -> [u64; 3] {
+        use std::arch::aarch64::*;
+        unsafe {
+            const BITS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+            let bits = vld1q_u8(BITS.as_ptr());
+            let v = [vld1q_u8(p), vld1q_u8(p.add(16)), vld1q_u8(p.add(32)), vld1q_u8(p.add(48))];
+            let mask = |byte: u8| {
+                let c = vdupq_n_u8(byte);
+                let t = |i: usize| vandq_u8(vceqq_u8(v[i], c), bits);
+                // Three rounds of pairwise adds turn 64 weighted bytes into 8 mask bytes.
+                let s = vpaddq_u8(vpaddq_u8(t(0), t(1)), vpaddq_u8(t(2), t(3)));
+                vgetq_lane_u64::<0>(vreinterpretq_u64_u8(vpaddq_u8(s, s)))
+            };
+            [mask(b','), mask(b'\n'), mask(b'"')]
+        }
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,popcnt")]
-unsafe fn rows_avx2<'a, const N: usize>(bytes: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
-    use std::arch::x86_64::*;
-    let mut ends = [0usize; N];
-    let mut count = 0usize;
-    let mut line_start = 0usize;
-    let mut quote_count = 0u32;
-    let comma = _mm256_set1_epi8(b',' as i8);
-    let newline = _mm256_set1_epi8(b'\n' as i8);
-    let quote = _mm256_set1_epi8(b'"' as i8);
-    let mut tail;
-    let mut offset = 0usize;
-    while offset < bytes.len() {
-        let block = if offset + 32 <= bytes.len() {
-            unsafe { _mm256_loadu_si256(bytes.as_ptr().add(offset).cast()) }
-        } else {
-            tail = [0u8; 32];
-            tail[..bytes.len() - offset].copy_from_slice(&bytes[offset..]);
-            unsafe { _mm256_loadu_si256(tail.as_ptr().cast()) }
-        };
-        let commas = _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, comma)) as u32;
-        let newlines = _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, newline)) as u32;
-        let mut quotes = _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, quote)) as u32;
-        let mut delims = commas | newlines;
-        while delims != 0 {
-            let i = delims.trailing_zeros();
-            let bit = 1u32 << i;
-            let p = offset + i as usize;
-            delims &= delims - 1;
-            if newlines & bit == 0 {
-                if count < N - 1 {
-                    ends[count] = p;
-                }
-                count += 1;
-            } else {
-                if count == N - 1 {
-                    ends[N - 1] = p;
-                    let line_quotes = quote_count + (quotes & (bit - 1)).count_ones();
-                    emit_counted(bytes, line_start, &ends, line_quotes, &mut f);
-                }
-                count = 0;
-                line_start = p + 1;
-                quote_count = 0;
-                // Quotes up to and including this newline belong to the finished line.
-                quotes &= !(bit | (bit - 1));
+struct Avx2;
+
+#[cfg(target_arch = "x86_64")]
+impl Masker for Avx2 {
+    #[inline(always)]
+    unsafe fn masks(p: *const u8) -> [u64; 3] {
+        use std::arch::x86_64::*;
+        unsafe {
+            let lo = _mm256_loadu_si256(p.cast());
+            let hi = _mm256_loadu_si256(p.add(32).cast());
+            let mask = |byte: u8| {
+                let c = _mm256_set1_epi8(byte as i8);
+                let a = _mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, c)) as u32 as u64;
+                let b = _mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, c)) as u32 as u64;
+                a | b << 32
+            };
+            [mask(b','), mask(b'\n'), mask(b'"')]
+        }
+    }
+}
+
+/// Portable masks, used to test the splitter logic on any machine.
+#[cfg(test)]
+struct Plain;
+
+#[cfg(test)]
+impl Masker for Plain {
+    unsafe fn masks(p: *const u8) -> [u64; 3] {
+        let mut out = [0u64; 3];
+        for i in 0..64 {
+            let byte = unsafe { *p.add(i) };
+            for (mask, c) in out.iter_mut().zip([b',', b'\n', b'"']) {
+                *mask |= u64::from(byte == c) << i;
             }
         }
-        quote_count += quotes.count_ones();
-        offset += 32;
+        out
     }
-    if count == N - 1 {
-        ends[N - 1] = bytes.len();
-        emit_counted(bytes, line_start, &ends, quote_count, &mut f);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
+unsafe fn rows_avx2<'a, const N: usize>(bytes: &'a [u8], f: impl FnMut([&'a [u8]; N])) {
+    unsafe { rows_masked::<N, Avx2, _>(bytes, f) }
+}
+
+/// Writes the positions of the set bits of `m` (offset by `base`) to `out`, returns how many.
+/// Writes at least 8 entries whatever the count, so `out` needs 16 entries of slack.
+#[inline(always)]
+unsafe fn flatten(mut m: u64, base: u32, out: *mut u32) -> usize {
+    let count = m.count_ones() as usize;
+    unsafe {
+        for i in 0..8 {
+            *out.add(i) = base + m.trailing_zeros();
+            m &= m.wrapping_sub(1);
+        }
+        if count > 8 {
+            for i in 8..16 {
+                *out.add(i) = base + m.trailing_zeros();
+                m &= m.wrapping_sub(1);
+            }
+            for i in 16..count {
+                *out.add(i) = base + m.trailing_zeros();
+                m &= m.wrapping_sub(1);
+            }
+        }
+    }
+    count
+}
+
+/// Bytes of input a segment aims for. A segment always ends after a newline.
+const SEGMENT: usize = 16 * 1024;
+const SLACK: usize = 24;
+
+/// Same rows as `rows_scalar`. Each segment of whole lines is scanned once for comma, newline and
+/// quote bit masks that are flattened into position lists; rows are then cut from the lists.
+#[inline(always)]
+unsafe fn rows_masked<'a, const N: usize, M: Masker, F: FnMut([&'a [u8]; N])>(bytes: &'a [u8], mut f: F) {
+    let mut commas: Vec<u32> = Vec::new();
+    let mut newlines: Vec<u32> = Vec::new();
+    // Quotes seen in the segment before each newline.
+    let mut quotes_before: Vec<u32> = Vec::new();
+    let mut segment_start = 0usize;
+    let mut line_start = 0usize;
+    while segment_start < bytes.len() {
+        let mut segment_end = bytes.len();
+        if segment_end - segment_start > SEGMENT {
+            segment_end = match memchr(b'\n', &bytes[segment_start + SEGMENT..]) {
+                Some(newline) => segment_start + SEGMENT + newline + 1,
+                None => bytes.len(),
+            };
+        }
+        let room = segment_end - segment_start + SLACK;
+        if commas.len() < room {
+            commas.resize(room, 0);
+            newlines.resize(room, 0);
+            quotes_before.resize(room, 0);
+        }
+        let (mut comma_count, mut newline_count, mut quote_count) = (0usize, 0usize, 0u32);
+        let mut offset = segment_start;
+        while offset < segment_end {
+            let block = if offset + 64 <= segment_end {
+                unsafe { M::masks(bytes.as_ptr().add(offset)) }
+            } else {
+                // Zero padding holds no delimiter.
+                let mut tail = [0u8; 64];
+                tail[..segment_end - offset].copy_from_slice(&bytes[offset..segment_end]);
+                unsafe { M::masks(tail.as_ptr()) }
+            };
+            let [comma_mask, newline_mask, quote_mask] = block;
+            let base = offset as u32;
+            unsafe {
+                comma_count += flatten(comma_mask, base, commas.as_mut_ptr().add(comma_count));
+                // Two newline entries are written whatever the count: most blocks hold 0 to 2.
+                let n = newline_mask.count_ones() as usize;
+                let mut m = newline_mask;
+                for i in 0..n.max(2) {
+                    let bit = m.trailing_zeros();
+                    newlines[newline_count + i] = base + bit;
+                    quotes_before[newline_count + i] =
+                        quote_count + (quote_mask & (1u64 << (bit & 63)).wrapping_sub(1)).count_ones();
+                    m &= m.wrapping_sub(1);
+                }
+                newline_count += n;
+            }
+            quote_count += quote_mask.count_ones();
+            offset += 64;
+        }
+        if segment_end == bytes.len() && bytes[segment_end - 1] != b'\n' {
+            // An unterminated last line ends at the end of the input.
+            newlines[newline_count] = segment_end as u32;
+            quotes_before[newline_count] = quote_count;
+            newline_count += 1;
+        }
+        // Sentinels: a comma list that runs out never matches a newline.
+        commas[comma_count..comma_count + 8].fill(u32::MAX);
+        let (mut next_comma, mut previous_quotes) = (0usize, 0u32);
+        for k in 0..newline_count {
+            let newline = newlines[k];
+            let quotes = quotes_before[k] - previous_quotes;
+            previous_quotes = quotes_before[k];
+            if commas[next_comma + N - 2] < newline && commas[next_comma + N - 1] > newline {
+                let mut ends = [0usize; N];
+                for (end, &comma) in ends.iter_mut().zip(&commas[next_comma..next_comma + N - 1]) {
+                    *end = comma as usize;
+                }
+                ends[N - 1] = newline as usize;
+                emit_counted(bytes, line_start, &ends, quotes, &mut f);
+                next_comma += N - 1;
+            } else {
+                while commas[next_comma] < newline {
+                    next_comma += 1;
+                }
+            }
+            line_start = newline as usize + 1;
+        }
+        segment_start = segment_end;
     }
 }
 
 /// Like `emit`, but the caller already counted the quotes in the line. The line is well formed
 /// exactly when every quote is the first or last byte of a field that has both.
+/// `line_start <= ends[0] < ends[1] < ... < bytes.len()` is the caller's contract (the positions of
+/// consecutive delimiters in `bytes`), which keeps every slice below in bounds.
 #[inline(always)]
 fn emit_counted<'a, const N: usize>(
     bytes: &'a [u8],
@@ -475,12 +623,15 @@ fn emit_counted<'a, const N: usize>(
     quotes: u32,
     f: &mut impl FnMut([&'a [u8]; N]),
 ) {
+    debug_assert!(line_start <= ends[0] && ends.windows(2).all(|w| w[0] < w[1]) && ends[N - 1] <= bytes.len());
     let mut out = [&[][..]; N];
     let mut start = line_start;
     let mut wrapped = 0u32;
     for k in 0..N {
-        let value = &bytes[start..ends[k]];
-        start = ends[k] + 1;
+        let end = ends[k];
+        // SAFETY: see the contract above; `start` is the previous delimiter plus one.
+        let value = unsafe { bytes.get_unchecked(start..end) };
+        start = end + 1;
         out[k] = if quotes != 0 {
             if let [b'"', inner @ .., b'"'] = value {
                 wrapped += 1;
@@ -533,5 +684,62 @@ pub fn will_need(chunk: &[u8]) {
     if last > first {
         // SAFETY: MADV_WILLNEED only advises; it never changes or unmaps memory.
         unsafe { libc::madvise(first as *mut libc::c_void, last - first, libc::MADV_WILLNEED) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn collect<const N: usize>(run: impl FnOnce(&mut dyn FnMut([&[u8]; N]))) -> Vec<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        run(&mut |row| out.push(row.iter().map(|field| field.to_vec()).collect()));
+        out
+    }
+
+    fn check<const N: usize>(bytes: &[u8]) {
+        let expected = collect::<N>(|f| rows_scalar::<N>(bytes, f));
+        let plain = collect::<N>(|f| unsafe { rows_masked::<N, Plain, _>(bytes, f) });
+        assert_eq!(plain, expected, "plain masks, input {:?}", String::from_utf8_lossy(bytes));
+        let fast = collect::<N>(|f| rows::<N>(bytes, f));
+        assert_eq!(fast, expected, "rows, input {:?}", String::from_utf8_lossy(bytes));
+    }
+
+    #[test]
+    fn masked_rows_match_scalar_on_random_text() {
+        let mut state = 0x1234_5678_9abc_def1u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // Few distinct bytes, so lines often hold exactly N - 1 commas and many quotes.
+        let alphabet = *b",,,\n\"a\"ab\r,";
+        for round in 0..4000 {
+            let len = (next() % if round % 50 == 0 { 70_000 } else { 300 }) as usize;
+            let bytes: Vec<u8> = (0..len).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect();
+            check::<2>(&bytes);
+            check::<4>(&bytes);
+            check::<7>(&bytes);
+        }
+    }
+
+    #[test]
+    fn masked_rows_handle_edges() {
+        for text in [
+            "", "\n", "a,b\n", "a,b", "a,b\n\n,\n\"a\",\"b\"", "\"\",\"\"\n\"\"\",\"x\n", "a,b,c,d,e,f,g",
+            "a,b,c,d,e,f,g\n", "a,b,c,d,e,f,g,h\n1,2,3,4,5,6,7\n",
+        ] {
+            check::<2>(text.as_bytes());
+            check::<7>(text.as_bytes());
+        }
+        // Well formed lines straddling every block and segment boundary.
+        let line = "\"e12345\",u1,2026-10-01T00:00:00Z,2026-10-01T00:00:01Z,view,p1,\n";
+        for pad in 0..70 {
+            let text = format!("{}{}", "x,\n".repeat(pad), line.repeat(700));
+            check::<7>(text.as_bytes());
+            check::<7>(&text.as_bytes()[..text.len() - 1]);
+        }
     }
 }
