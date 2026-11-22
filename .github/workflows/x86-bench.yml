@@ -120,16 +120,6 @@ jobs:
           (cd generator && cargo build --release)
           generator/target/release/generate --seed 20261015 --events "${{ inputs.events }}" \
             --clicks $(( ${{ inputs.events }} / 4 )) --output /tmp/data
-      - name: Splitter A/B, branch-free vs branchy quote trimming (ladder level 1, one thread)
-        run: |
-          cargo build --release --locked --features prof,branchy
-          cp target/release/shopping-sessions /tmp/prof-branchy
-          for round in 1 2 3 4 5; do
-            for bin in /tmp/prof /tmp/prof-branchy; do
-              rm -rf /tmp/o; mkdir /tmp/o
-              echo "split L1 $bin round $round: $(NCPU=1 SS_LADDER=1 $bin /tmp/data /tmp/o 2>&1 | grep 'route_rows (')"
-            done
-          done
       - name: Parse ladder, one thread (CPU ns per row = diff between levels / rows)
         run: |
           NCPU=1 SS_LADDER=0 /tmp/prof /tmp/data /tmp/o >/dev/null 2>&1 || true   # warm the page cache

@@ -15,8 +15,6 @@ serde_json = "1.0.154"
 [features]
 # Sub-phase timers and counters, printed to stderr. Off in the scored build.
 prof = []
-# Temporary: the branchy quote trimming, for A/B timing against the branch-free one.
-branchy = []
 
 [profile.release]
 lto = "fat"
