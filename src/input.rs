@@ -624,24 +624,49 @@ fn emit_counted<'a, const N: usize>(
     f: &mut impl FnMut([&'a [u8]; N]),
 ) {
     debug_assert!(line_start <= ends[0] && ends.windows(2).all(|w| w[0] < w[1]) && ends[N - 1] <= bytes.len());
+    debug_assert!(!bytes.is_empty());
     let mut out = [&[][..]; N];
     let mut start = line_start;
     let mut wrapped = 0u32;
-    for k in 0..N {
-        let end = ends[k];
-        // SAFETY: see the contract above; `start` is the previous delimiter plus one.
-        let value = unsafe { bytes.get_unchecked(start..end) };
-        start = end + 1;
-        out[k] = if quotes != 0 {
-            if let [b'"', inner @ .., b'"'] = value {
-                wrapped += 1;
-                inner
+    if cfg!(feature = "branchy") {
+        // The previous version, kept to A/B the two on x86.
+        for k in 0..N {
+            let value = unsafe { bytes.get_unchecked(start..ends[k]) };
+            start = ends[k] + 1;
+            out[k] = if quotes != 0 {
+                if let [b'"', inner @ .., b'"'] = value {
+                    wrapped += 1;
+                    inner
+                } else {
+                    value
+                }
             } else {
                 value
-            }
-        } else {
-            value
+            };
+        }
+        if quotes == 2 * wrapped {
+            f(out);
+        }
+        return;
+    }
+    for k in 0..N {
+        let end = ends[k];
+        // Branch-free: whether a field is wrapped in quotes is unpredictable (about a fifth of
+        // fields are), so select the trimmed bounds arithmetically. Both bytes read are inside
+        // `bytes` (clamped), and only count when the field has at least two bytes.
+        let last_index = bytes.len() - 1;
+        // SAFETY: the indexes are clamped into `bytes`.
+        let (first, last) = unsafe {
+            (
+                *bytes.get_unchecked(start.min(last_index)),
+                *bytes.get_unchecked(end.saturating_sub(1).min(last_index)),
+            )
         };
+        let wrap = usize::from(end - start >= 2 && first == b'"' && last == b'"');
+        wrapped += wrap as u32;
+        // SAFETY: see the contract above; with `wrap` the bounds move inward by one byte each.
+        out[k] = unsafe { bytes.get_unchecked(start + wrap..end - wrap) };
+        start = end + 1;
     }
     if quotes == 2 * wrapped {
         f(out);
