@@ -1,5 +1,6 @@
 mod input;
 mod output;
+mod prof;
 #[cfg(target_os = "linux")]
 mod huge;
 
@@ -491,14 +492,25 @@ fn worker_of(hash: u64, workers: usize) -> usize {
     (((hash >> 32) * workers as u64) >> 32) as usize
 }
 
-fn route_rows<'a>(
+/// `L` is a profiling ladder: each level stops after one more operation per row (0 only counts
+/// lines, 1 splits, 2 adds the event-ID hash, 3 the user hashes, 4 both timestamps, 5 validation,
+/// 6 and above the full row push). Levels below 6 return empty shards and exist only to measure
+/// what each operation costs; the scored build always uses 99.
+fn route_rows<'a, const L: u32>(
     chunks: Vec<(u32, Text<'a>)>,
     catalog: &Catalog<'a>,
     start: i64,
     end: i64,
     shard_count: usize,
 ) -> Vec<Vec<Row>> {
+    let t0 = prof::now();
     let lines: usize = chunks.iter().map(|(_, chunk)| memchr::memchr_iter(b'\n', chunk).count()).sum();
+    if L == 0 {
+        std::hint::black_box(lines);
+        prof::add(prof::ROUTE, t0);
+        return Vec::new();
+    }
+    let mut sink = 0u64;
     let share = lines / shard_count + lines / shard_count / 16 + 64;
     let mut shards: Vec<Vec<Row>> = (0..shard_count).map(|_| Vec::with_capacity(share)).collect();
     let mut dates = Dates::new();
@@ -510,6 +522,13 @@ fn route_rows<'a>(
             will_need(ahead);
         }
         rows::<7>(chunk, |[id, user, ts, ingest, kind, product, price]| {
+        if L == 1 {
+            sink = sink.wrapping_add(
+                (id.len() + user.len() + ts.len() + ingest.len() + kind.len() + product.len() + price.len())
+                    as u64,
+            );
+            return;
+        }
         if id.is_empty() || ingest.len() != 20 {
             return;
         }
@@ -520,6 +539,21 @@ fn route_rows<'a>(
         // Keep shard bits separate from hashbrown's low bucket bits (below 2^32 buckets) and its
         // top seven tag bits.
         let shard = ((hash >> 40) as usize) % shard_count;
+        if L == 2 {
+            sink = sink.wrapping_add(hash ^ shard as u64 ^ offset as u64);
+            return;
+        }
+        let (user_hash, user_hash2) = (crate::hash(user), hash2(user));
+        if L == 3 {
+            sink = sink.wrapping_add(user_hash ^ user_hash2);
+            return;
+        }
+        if L == 4 {
+            let a = timestamp_cached(ts, &mut dates).unwrap_or(0);
+            let b = timestamp_cached(ingest, &mut dates).unwrap_or(0);
+            sink = sink.wrapping_add((a ^ b) as u64);
+            return;
+        }
         let parsed = (|| {
             if user.is_empty() || product.is_empty() {
                 return None;
@@ -547,10 +581,14 @@ fn route_rows<'a>(
             Some((ts, price, category))
         })();
         let (ts, price, category) = parsed.unwrap_or((0, 0, INVALID));
+        if L == 5 {
+            sink = sink.wrapping_add(ts as u64 ^ u64::from(price) ^ u64::from(category));
+            return;
+        }
         shards[shard].push(Row {
             hash,
-            user_hash: crate::hash(user),
-            user_hash2: hash2(user),
+            user_hash,
+            user_hash2,
             ts,
             price,
             category,
@@ -559,6 +597,8 @@ fn route_rows<'a>(
         });
         });
     }
+    std::hint::black_box(sink);
+    prof::add(prof::ROUTE, t0);
     shards
 }
 
@@ -576,6 +616,8 @@ fn dedup_events<'a>(
     workers: usize,
 ) -> Vec<Vec<NamedEvent>> {
     let total: usize = batches.iter().map(Vec::len).sum();
+    let mut t = prof::now();
+    let (mut pairs, mut compares) = (0u64, 0u64);
     let mut kept: HashTable<Slot> = HashTable::with_capacity(total);
     for (b, batch) in batches.iter().enumerate() {
         for (p, row) in batch.iter().enumerate() {
@@ -587,9 +629,11 @@ fn dedup_events<'a>(
             match kept.entry(
                 row.hash,
                 |old| {
-                    old.hash == row.hash
-                        && cold_field(chunks, batches[old.batch as usize][old.pos as usize].line, 0)
+                    old.hash == row.hash && {
+                        compares += 1;
+                        cold_field(chunks, batches[old.batch as usize][old.pos as usize].line, 0)
                             == cold_field(chunks, row.line, 0)
+                    }
                 },
                 |slot| slot.hash,
             ) {
@@ -597,6 +641,7 @@ fn dedup_events<'a>(
                     entry.insert(slot);
                 }
                 Entry::Occupied(mut entry) => {
+                    pairs += 1;
                     let old = &batches[entry.get().batch as usize][entry.get().pos as usize];
                     if cold_field(chunks, row.line, 3) < cold_field(chunks, old.line, 3) {
                         *entry.get_mut() = slot;
@@ -605,18 +650,31 @@ fn dedup_events<'a>(
             }
         }
     }
+    let mut inserted = 0u64;
+    prof::split(&mut inserted, &mut t);
+    prof::add_ns(prof::DEDUP_INSERT, inserted);
+    prof::add_ns(prof::C_ROWS, total as u64);
+    prof::add_ns(prof::C_DUP_PAIRS, pairs);
+    prof::add_ns(prof::C_KEY_COMPARES, compares);
     let mut winner: Vec<Vec<bool>> = batches.iter().map(|batch| vec![false; batch.len()]).collect();
     for slot in &kept {
         winner[slot.batch as usize][slot.pos as usize] = true;
     }
     drop(kept);
+    let mut flagged = 0u64;
+    prof::split(&mut flagged, &mut t);
+    prof::add_ns(prof::DEDUP_WINNER, flagged);
 
     let share = total / workers + total / workers / 8 + 16;
     let mut routed: Vec<Vec<NamedEvent>> = (0..workers).map(|_| Vec::with_capacity(share)).collect();
+    let mut linked_events = 0u64;
     for (batch, winner) in batches.iter().zip(&winner) {
         for (row, _) in batch.iter().zip(winner).filter(|&(row, &win)| win && row.category != INVALID) {
             let (name, hash, hash2) = match people.resolve(row.user_hash, row.user_hash2) {
-                Some(slot) => (NameRef::linked(slot.person), slot.target.0, slot.target.1),
+                Some(slot) => {
+                    linked_events += 1;
+                    (NameRef::linked(slot.person), slot.target.0, slot.target.1)
+                }
                 None => (NameRef::line(row.line), row.user_hash, row.user_hash2),
             };
             routed[worker_of(hash, workers)].push(NamedEvent {
@@ -631,6 +689,11 @@ fn dedup_events<'a>(
             });
         }
     }
+    let mut routed_ns = 0u64;
+    prof::split(&mut routed_ns, &mut t);
+    prof::add_ns(prof::DEDUP_ROUTE, routed_ns);
+    prof::add_ns(prof::C_LINKED_EVENTS, linked_events);
+    prof::add_ns(prof::C_SURVIVORS, routed.iter().map(|r| r.len() as u64).sum());
     routed
 }
 
@@ -642,6 +705,7 @@ fn route_clicks<'a>(
     end: i64,
     workers: usize,
 ) -> Vec<Vec<NamedClick<'a>>> {
+    let t0 = prof::now();
     let mut routed: Vec<Vec<NamedClick>> = (0..workers).map(|_| Vec::new()).collect();
     let mut dates = Dates::new();
     for chunk in chunks.iter().take(2) {
@@ -681,6 +745,7 @@ fn route_clicks<'a>(
         });
         });
     }
+    prof::add(prof::CLICKS, t0);
     routed
 }
 
@@ -837,17 +902,25 @@ fn aggregate<'a>(
     chunks: &[Text<'a>],
     links: &Links<'a>,
 ) -> (Vec<UserRow<'a>>, DailyTotals) {
+    let mut t = prof::now();
     let mut people = People::default();
     let event_count: usize = event_batches.iter().map(Vec::len).sum();
     let mut event_person = Vec::with_capacity(event_count);
     for event in event_batches.iter().flatten() {
         event_person.push(people.intern(event.hash, event.hash2, || event.name.text(chunks, links)));
     }
+    let mut ns = 0u64;
+    prof::split(&mut ns, &mut t);
+    prof::add_ns(prof::AGG_INTERN_EVENTS, ns);
     let mut click_person = Vec::with_capacity(click_batches.iter().map(Vec::len).sum());
     for click in click_batches.iter().flatten() {
         click_person.push(people.find(click.hash, click.hash2));
     }
+    let mut ns = 0u64;
+    prof::split(&mut ns, &mut t);
+    prof::add_ns(prof::AGG_FIND_CLICKS, ns);
     let person_count = people.names.len();
+    prof::add_ns(prof::C_PEOPLE, person_count as u64);
     let (mut events, event_start) = group_by_person(
         event_batches
             .iter()
@@ -857,6 +930,9 @@ fn aggregate<'a>(
         event_count,
         person_count,
     );
+    let mut ns = 0u64;
+    prof::split(&mut ns, &mut t);
+    prof::add_ns(prof::AGG_GROUP_EVENTS, ns);
     let click_count = click_person.iter().flatten().count();
     let (mut clicks, click_start) = group_by_person(
         click_batches
@@ -868,6 +944,12 @@ fn aggregate<'a>(
         person_count,
     );
     drop((event_batches, click_batches, event_person, click_person));
+    let mut ns = 0u64;
+    prof::split(&mut ns, &mut t);
+    prof::add_ns(prof::AGG_GROUP_CLICKS, ns);
+    prof::add_ns(prof::C_CLICKS_KEPT, click_count as u64);
+    let (mut sort_events, mut sort_clicks, mut sessionize, mut flush) = (0u64, 0u64, 0u64, 0u64);
+    let mut sessions_total = 0u64;
 
     let mut users = Vec::new();
     let campaign_count = catalog.campaigns.names.len();
@@ -878,8 +960,10 @@ fn aggregate<'a>(
 
     for person in 0..person_count {
         let name = people.names[person];
+        prof::split(&mut sessionize, &mut t);
         let person_events = &mut events[event_start[person] as usize..event_start[person + 1] as usize];
         person_events.sort_unstable_by_key(|event| event.ts);
+        prof::split(&mut sort_events, &mut t);
         // At a tied timestamp the last click must have the smallest byte ID.
         let person_clicks = &mut clicks[click_start[person] as usize..click_start[person + 1] as usize];
         person_clicks.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| b.id.cmp(a.id)));
@@ -895,6 +979,7 @@ fn aggregate<'a>(
             }
         }
         let person_clicks = &person_clicks[..kept];
+        prof::split(&mut sort_clicks, &mut t);
 
         let mut daily = UserRow::new(name);
         let mut first = 0;
@@ -903,8 +988,11 @@ fn aggregate<'a>(
         for session in person_events.chunk_by(|a, b| b.ts - a.ts <= GAP) {
             let start = session[0].ts;
             let day = start.div_euclid(DAY) as i32;
+            sessions_total += 1;
             if daily.sessions != 0 && daily.day != day {
+                prof::split(&mut sessionize, &mut t);
                 flush_daily(&mut users, daily, &mut touched, &mut spend, catalog);
+                prof::split(&mut flush, &mut t);
                 daily = UserRow::new(name);
             }
             daily.day = day;
@@ -946,9 +1034,15 @@ fn aggregate<'a>(
             total.purchasing += i64::from(revenue != 0);
             total.revenue += revenue;
         }
+        prof::split(&mut sessionize, &mut t);
         flush_daily(&mut users, daily, &mut touched, &mut spend, catalog);
+        prof::split(&mut flush, &mut t);
     }
-
+    prof::add_ns(prof::AGG_SORT_EVENTS, sort_events);
+    prof::add_ns(prof::AGG_SORT_CLICKS, sort_clicks);
+    prof::add_ns(prof::AGG_SESSIONIZE, sessionize);
+    prof::add_ns(prof::AGG_FLUSH, flush);
+    prof::add_ns(prof::C_SESSIONS, sessions_total);
     (users, campaigns)
 }
 
@@ -970,6 +1064,15 @@ fn flush_daily<'a>(
         .max_by_key(|&(revenue, name)| (revenue, Reverse(name)))
         .map(|(_, name)| name);
     out.push(row);
+}
+
+/// Profiling ladder level from `SS_LADDER` (only with the `prof` feature), else the full pipeline.
+fn ladder_level() -> u32 {
+    if cfg!(feature = "prof") {
+        env::var("SS_LADDER").ok().and_then(|s| s.parse().ok()).unwrap_or(99)
+    } else {
+        99
+    }
 }
 
 fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
@@ -1024,20 +1127,35 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
     lap("catalog + files");
     let shards = dedup_shards(event_files.iter().map(|file| file.bytes().len()).sum());
     let (event_chunks, event_batches) = index_chunks(chunk_batches(&event_files, workers))?;
+    let t0 = prof::now();
     let link_rows = parallel(chunk_batches(&links, workers), workers, parse_links);
+    prof::add(prof::LINK_PARSE, t0);
     lap("link parse");
     let (people, copies) = thread::scope(|scope| {
         let people = scope.spawn(|| {
             let t = std::time::Instant::now();
+            let t0 = prof::now();
             let people = build_links(link_rows);
+            prof::add(prof::BUILD_LINKS, t0);
             if timing {
                 eprintln!("  build_links: {:?}", t.elapsed());
             }
             people
         });
-        let copies = parallel(event_batches, workers, |chunks| {
-            route_rows(chunks, &catalog, start, end, shards)
+        let ladder = ladder_level();
+        let copies = parallel(event_batches, workers, |chunks| match ladder {
+            0 => route_rows::<0>(chunks, &catalog, start, end, shards),
+            1 => route_rows::<1>(chunks, &catalog, start, end, shards),
+            2 => route_rows::<2>(chunks, &catalog, start, end, shards),
+            3 => route_rows::<3>(chunks, &catalog, start, end, shards),
+            4 => route_rows::<4>(chunks, &catalog, start, end, shards),
+            5 => route_rows::<5>(chunks, &catalog, start, end, shards),
+            _ => route_rows::<99>(chunks, &catalog, start, end, shards),
         });
+        if ladder < 6 {
+            prof::report();
+            std::process::exit(0);
+        }
         (people.join().unwrap(), copies)
     });
     lap("links+route");
@@ -1067,7 +1185,9 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
         |(shard, (events, clicks))| -> Result<DailyTotals> {
             let (users, campaigns) = aggregate(events, clicks, &catalog, days, &event_chunks, &people);
             if shard == 0 || !users.is_empty() {
+                let t0 = prof::now();
                 output::users(&user_folder.join(format!("part-{shard}.parquet")), &users)?;
+                prof::add(prof::WRITE_USERS, t0);
             }
             Ok(campaigns)
         },
@@ -1093,8 +1213,11 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
             totals,
         })
         .collect();
+    let t0 = prof::now();
     output::campaigns(&campaign_folder.join("part-0.parquet"), &rows)?;
+    prof::add(prof::WRITE_CAMPAIGNS, t0);
     lap("campaigns");
+    prof::report();
     Ok(())
 }
 
