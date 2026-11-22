@@ -34,7 +34,8 @@ const SHARD_ROWS: usize = 40_000;
 /// Dedup shards for `event_bytes` of input (about 88 bytes a row): enough that a shard's table
 /// stays cache-resident, between 32 and 4096. A power of two, as the shard index is a remainder.
 fn dedup_shards(event_bytes: usize) -> usize {
-    (event_bytes / 88 / SHARD_ROWS).next_power_of_two().clamp(32, 4096)
+    let rows = env::var("SS_SHARD_ROWS").ok().and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(SHARD_ROWS);
+    (event_bytes / 88 / rows).next_power_of_two().clamp(32, 4096)
 }
 
 /// A second hash, independent of `hash`, built from folded 128-bit multiplies.
