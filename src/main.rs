@@ -684,12 +684,21 @@ struct Slot {
     pos: u32,
 }
 
-/// Requests the first cache lines of an input line, which sit cold in the input mapping.
+/// Requests the first cache lines of an input line, which sit cold in the input mapping. With
+/// `touch` the lines are read for real instead of prefetched (a prefetch can be dropped on a TLB miss).
 #[inline(always)]
-fn prefetch_line(chunks: &[Text<'_>], line: Line) {
-    let at = chunks[line.chunk as usize].as_ptr().wrapping_add(line.offset as usize);
-    prefetch(at);
-    prefetch(at.wrapping_add(64));
+fn prefetch_line(chunks: &[Text<'_>], line: Line, touch: bool) -> u8 {
+    let chunk = chunks[line.chunk as usize];
+    let at = line.offset as usize;
+    if touch {
+        // Both bytes are in the chunk: a line is at least a few bytes and the second read is
+        // clamped to the chunk's end.
+        chunk[at] ^ chunk[(at + 64).min(chunk.len() - 1)]
+    } else {
+        prefetch(chunk.as_ptr().wrapping_add(at));
+        prefetch(chunk.as_ptr().wrapping_add(at + 64));
+        0
+    }
 }
 
 /// True for the copy that counts in each group of rows with one event ID: the earliest ingest time,
@@ -705,6 +714,8 @@ fn winners<'a>(batches: &[Vec<Row>], chunks: &[Text<'a>], total: usize) -> Vec<V
 /// comparing IDs on first sight instead.
 fn winners_deferred<'a>(batches: &[Vec<Row>], chunks: &[Text<'a>], total: usize) -> Option<Vec<Vec<bool>>> {
     const AHEAD: usize = 8;
+    let touch = std::env::var_os("SS_TOUCH").is_some();
+    let mut sink = 0u8;
     let mut kept: HashTable<Slot> = HashTable::with_capacity(total);
     // Copies whose hash was already in the table, as (batch, position).
     let mut later: Vec<(u32, u32)> = Vec::new();
@@ -722,9 +733,9 @@ fn winners_deferred<'a>(batches: &[Vec<Row>], chunks: &[Text<'a>], total: usize)
     for i in 0..later.len() {
         if let Some(&(b, p)) = later.get(i + AHEAD) {
             let row = &batches[b as usize][p as usize];
-            prefetch_line(chunks, row.line);
+            sink ^= prefetch_line(chunks, row.line, touch);
             if let Some(slot) = kept.find(row.hash, |slot| slot.hash == row.hash) {
-                prefetch_line(chunks, batches[slot.batch as usize][slot.pos as usize].line);
+                sink ^= prefetch_line(chunks, batches[slot.batch as usize][slot.pos as usize].line, touch);
             }
         }
         let (b, p) = later[i];
@@ -745,6 +756,7 @@ fn winners_deferred<'a>(batches: &[Vec<Row>], chunks: &[Text<'a>], total: usize)
             *slot = Slot { hash: row.hash, batch: b, pos: p };
         }
     }
+    std::hint::black_box(sink);
     let mut winner: Vec<Vec<bool>> = batches.iter().map(|batch| vec![false; batch.len()]).collect();
     for slot in &kept {
         winner[slot.batch as usize][slot.pos as usize] = true;
