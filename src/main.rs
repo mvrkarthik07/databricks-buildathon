@@ -1,5 +1,10 @@
 mod input;
 mod output;
+#[cfg(target_os = "linux")]
+mod thp;
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static ALLOC: thp::Alloc = thp::Alloc;
 
 use std::cmp::{Reverse, min};
 use std::env;
@@ -1074,6 +1079,12 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    // Huge pages are on by default; SS_THP=0 turns them off. Where the kernel has them disabled,
+    // madvise is a harmless no-op and the buffers behave like ordinary ones.
+    #[cfg(target_os = "linux")]
+    if env::var_os("SS_THP").is_none_or(|v| v != "0") {
+        thp::ON.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let mut args = env::args_os().skip(1);
     let mut path =
         |key, default| PathBuf::from(args.next().or_else(|| env::var_os(key)).unwrap_or(default));
