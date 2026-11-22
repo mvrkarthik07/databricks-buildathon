@@ -320,7 +320,7 @@ engine on 10M-event seeds 7 and 99 and equals the scored build on the 20M datase
 | v3 + THP | 2382 | -11.7% | 8621 |
 
 Extra seeds, 10M events, 9 rounds, wall vs v1: seed 7: THP -78 ms (-6.1%), v2 +39, v3 +37; seed 99:
-THP -84 ms (-7.2%), v2 +109, v3 +77. An earlier run on an EPYC 7763 had v2 +56 ms at 20M and
+THP -84 ms (-7.2%), v2 +109, v3 +77. An earlier run on an EPYC 7763 had v2 +146 ms (3488 vs 3342) at 20M and
 +127/+172 ms on the 10M seeds, so the result does not depend on the CPU.
 
 ### Why v2 and v3 were rejected
