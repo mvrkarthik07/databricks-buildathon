@@ -607,7 +607,7 @@ fn worker_of(hash: u64, workers: usize) -> usize {
 /// Events per bucket the aggregation aims for: small enough that a bucket's people table, grouped
 /// events and sort all stay in cache. `SS_BUCKET_EVENTS` overrides it (tests use tiny buckets).
 fn bucket_events() -> usize {
-    env::var("SS_BUCKET_EVENTS").ok().and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(16_384)
+    env::var("SS_BUCKET_EVENTS").ok().and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(131_072)
 }
 
 /// Where a person's events and clicks go: each worker owns `per_worker` consecutive buckets, and a
