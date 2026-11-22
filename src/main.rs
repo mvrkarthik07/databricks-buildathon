@@ -756,21 +756,12 @@ struct Slot {
     pos: u32,
 }
 
-/// Requests the first cache lines of an input line, which sit cold in the input mapping. With
-/// `touch` the lines are read for real instead of prefetched (a prefetch can be dropped on a TLB miss).
+/// Requests the first cache lines of an input line, which sit cold in the input mapping.
 #[inline(always)]
-fn prefetch_line(chunks: &[Text<'_>], line: Line, touch: bool) -> u8 {
-    let chunk = chunks[line.chunk as usize];
-    let at = line.offset as usize;
-    if touch {
-        // Both bytes are in the chunk: a line is at least a few bytes and the second read is
-        // clamped to the chunk's end.
-        chunk[at] ^ chunk[(at + 64).min(chunk.len() - 1)]
-    } else {
-        prefetch(chunk.as_ptr().wrapping_add(at));
-        prefetch(chunk.as_ptr().wrapping_add(at + 64));
-        0
-    }
+fn prefetch_line(chunks: &[Text<'_>], line: Line) {
+    let at = chunks[line.chunk as usize].as_ptr().wrapping_add(line.offset as usize);
+    prefetch(at);
+    prefetch(at.wrapping_add(64));
 }
 
 /// True for the copy that counts in each group of rows with one event ID: the earliest ingest time,
@@ -779,15 +770,19 @@ fn prefetch_line(chunks: &[Text<'_>], line: Line, touch: bool) -> u8 {
 /// first and resolved later with their input lines prefetched: reading those lines back to compare
 /// IDs and ingest times is a DRAM miss each, and used to be most of this phase.
 fn winners<'a>(batches: &[Vec<Row>], chunks: &[Text<'a>], total: usize) -> Vec<Vec<bool>> {
-    winners_deferred(batches, chunks, total).unwrap_or_else(|| winners_exact(batches, chunks, total))
+    // `SS_DEFER=0` resolves repeats on first sight (for comparing the two).
+    static DEFER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DEFER.get_or_init(|| env::var_os("SS_DEFER").is_none_or(|v| v != "0")) {
+        winners_deferred(batches, chunks, total).unwrap_or_else(|| winners_exact(batches, chunks, total))
+    } else {
+        winners_exact(batches, chunks, total)
+    }
 }
 
 /// `None` when two different IDs share a hash (a 64-bit collision), which the caller handles by
 /// comparing IDs on first sight instead.
 fn winners_deferred<'a>(batches: &[Vec<Row>], chunks: &[Text<'a>], total: usize) -> Option<Vec<Vec<bool>>> {
     const AHEAD: usize = 8;
-    let touch = std::env::var_os("SS_TOUCH").is_some();
-    let mut sink = 0u8;
     let mut kept: HashTable<Slot> = HashTable::with_capacity(total);
     // Copies whose hash was already in the table, as (batch, position).
     let mut later: Vec<(u32, u32)> = Vec::new();
@@ -805,9 +800,9 @@ fn winners_deferred<'a>(batches: &[Vec<Row>], chunks: &[Text<'a>], total: usize)
     for i in 0..later.len() {
         if let Some(&(b, p)) = later.get(i + AHEAD) {
             let row = &batches[b as usize][p as usize];
-            sink ^= prefetch_line(chunks, row.line, touch);
+            prefetch_line(chunks, row.line);
             if let Some(slot) = kept.find(row.hash, |slot| slot.hash == row.hash) {
-                sink ^= prefetch_line(chunks, batches[slot.batch as usize][slot.pos as usize].line, touch);
+                prefetch_line(chunks, batches[slot.batch as usize][slot.pos as usize].line);
             }
         }
         let (b, p) = later[i];
@@ -828,7 +823,6 @@ fn winners_deferred<'a>(batches: &[Vec<Row>], chunks: &[Text<'a>], total: usize)
             *slot = Slot { hash: row.hash, batch: b, pos: p };
         }
     }
-    std::hint::black_box(sink);
     let mut winner: Vec<Vec<bool>> = batches.iter().map(|batch| vec![false; batch.len()]).collect();
     for slot in &kept {
         winner[slot.batch as usize][slot.pos as usize] = true;
