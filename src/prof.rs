@@ -7,6 +7,7 @@ use std::time::Instant;
 
 pub const ROUTE: usize = 0;
 pub const DEDUP_INSERT: usize = 1;
+#[allow(dead_code)] // the slot stays so the report's indices are stable
 pub const DEDUP_WINNER: usize = 2;
 pub const DEDUP_ROUTE: usize = 3;
 pub const CLICKS: usize = 4;

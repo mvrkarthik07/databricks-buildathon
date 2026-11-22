@@ -683,7 +683,7 @@ struct Slot {
 }
 
 fn dedup_events<'a>(
-    batches: Vec<Vec<Row>>,
+    mut batches: Vec<Vec<Row>>,
     people: &Links<'a>,
     chunks: &[Text<'a>],
     workers: usize,
@@ -693,8 +693,9 @@ fn dedup_events<'a>(
     let sys0 = prof::thread_sys();
     let (mut pairs, mut compares) = (0u64, 0u64);
     let mut kept: HashTable<Slot> = HashTable::with_capacity(total);
-    for (b, batch) in batches.iter().enumerate() {
-        for (p, row) in batch.iter().enumerate() {
+    for b in 0..batches.len() {
+        for p in 0..batches[b].len() {
+            let row = batches[b][p];
             let slot = Slot {
                 hash: row.hash,
                 batch: b as u32,
@@ -716,28 +717,25 @@ fn dedup_events<'a>(
                 }
                 Entry::Occupied(mut entry) => {
                     pairs += 1;
-                    let old = &batches[entry.get().batch as usize][entry.get().pos as usize];
-                    if cold_field(chunks, row.line, 3) < cold_field(chunks, old.line, 3) {
+                    let (ob, op) = (entry.get().batch as usize, entry.get().pos as usize);
+                    // The copy that loses is marked invalid in place, so only winners survive below.
+                    if cold_field(chunks, row.line, 3) < cold_field(chunks, batches[ob][op].line, 3) {
                         *entry.get_mut() = slot;
+                        batches[ob][op].category = INVALID;
+                    } else {
+                        batches[b][p].category = INVALID;
                     }
                 }
             }
         }
     }
+    drop(kept);
     let mut inserted = 0u64;
     prof::split(&mut inserted, &mut t);
     prof::add_ns(prof::DEDUP_INSERT, inserted);
     prof::add_ns(prof::C_ROWS, total as u64);
     prof::add_ns(prof::C_DUP_PAIRS, pairs);
     prof::add_ns(prof::C_KEY_COMPARES, compares);
-    let mut winner: Vec<Vec<bool>> = batches.iter().map(|batch| vec![false; batch.len()]).collect();
-    for slot in &kept {
-        winner[slot.batch as usize][slot.pos as usize] = true;
-    }
-    drop(kept);
-    let mut flagged = 0u64;
-    prof::split(&mut flagged, &mut t);
-    prof::add_ns(prof::DEDUP_WINNER, flagged);
 
     let share = total / workers + total / workers / 8 + 16;
     let mut routed: Vec<Vec<NamedEvent>> = (0..workers).map(|_| Vec::with_capacity(share)).collect();
@@ -766,8 +764,8 @@ fn dedup_events<'a>(
             });
         }
     };
-    for (batch, winner) in batches.iter().zip(&winner) {
-        for (row, _) in batch.iter().zip(winner).filter(|&(row, &win)| win && row.category != INVALID) {
+    for batch in &batches {
+        for row in batch.iter().filter(|row| row.category != INVALID) {
             pending.push(row);
             if pending.len() == BATCH {
                 route_pending(&mut pending, &mut routed);
