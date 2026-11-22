@@ -563,29 +563,6 @@ fn worker_of(hash: u64, workers: usize) -> usize {
     (((hash >> 32) * workers as u64) >> 32) as usize
 }
 
-/// Faults in the pages of `rows`' reserved capacity with one syscall instead of one trap per 4 KiB
-/// page (`MADV_POPULATE_WRITE`, Linux 5.14+). A hint: on an older kernel it fails and the pages
-/// fault in on first write as before. `SS_POP=0` turns it off.
-fn populate<T>(rows: &Vec<T>) {
-    #[cfg(target_os = "linux")]
-    {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| env::var_os("SS_POP").is_none_or(|v| v != "0")) {
-            return;
-        }
-        const PAGE: usize = 4096;
-        const MADV_POPULATE_WRITE: i32 = 23;
-        let start = (rows.as_ptr().addr() + PAGE - 1) & !(PAGE - 1);
-        let end = (rows.as_ptr().addr() + rows.capacity() * std::mem::size_of::<T>()) & !(PAGE - 1);
-        if end > start {
-            // SAFETY: the range lies inside the vector's own allocation, which is writable.
-            unsafe { libc::madvise(start as *mut libc::c_void, end - start, MADV_POPULATE_WRITE) };
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = rows;
-}
-
 /// `L` is a profiling ladder: each level stops after one more operation per row (0 only counts
 /// lines, 1 splits, 2 adds the event-ID hash, 3 the user hashes, 4 both timestamps, 5 validation,
 /// 6 and above the full row push). Levels below 6 return empty shards and exist only to measure
@@ -608,9 +585,6 @@ fn route_rows<'a, const L: u32>(
     let mut sink = 0u64;
     let share = lines / shard_count + lines / shard_count / 16 + 64;
     let mut shards: Vec<Vec<Row>> = (0..shard_count).map(|_| Vec::with_capacity(share)).collect();
-    if L >= 6 {
-        shards.iter().for_each(populate);
-    }
     let mut dates = Dates::new();
     for (_, chunk) in chunks.iter().take(2) {
         will_need(chunk);

@@ -42,7 +42,6 @@ jobs:
           (cd /tmp/basetree && cargo build --release --locked && cp target/release/shopping-sessions /tmp/base)
           (cd generator && cargo build --release)
           printf '#!/bin/sh\nSS_THP=0 exec /tmp/new "$@"\n' > /tmp/new-thp0; chmod +x /tmp/new-thp0
-          printf '#!/bin/sh\nSS_POP=0 exec /tmp/new "$@"\n' > /tmp/new-nopop; chmod +x /tmp/new-nopop
       - name: Unit tests (include the allocator tests)
         run: cargo test --release --locked
       - name: Adversarial fixtures and the Python oracle, huge pages on and off, 1/3/8 workers
@@ -79,8 +78,8 @@ jobs:
               echo "== $bin run $r"; rm -rf /tmp/o-lap; NCPU=$(nproc) SS_TIMING=1 $bin /tmp/data /tmp/o-lap 2>&1 | cut -c1-120
             done
           done
-      - name: Interleaved timing (base, this commit, this commit with SS_POP=0)
-        run: NCPU=$(nproc) python3 tools/ab.py /tmp/data 15 /tmp/base /tmp/new /tmp/new-nopop
+      - name: Interleaved timing (base, this commit, this commit with SS_THP=0)
+        run: NCPU=$(nproc) python3 tools/ab.py /tmp/data 15 /tmp/base /tmp/new /tmp/new-thp0
       - name: Other seeds, 10M events, output equality and timing
         run: |
           for seed in 7 99; do
