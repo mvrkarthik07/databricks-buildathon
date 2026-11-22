@@ -22,7 +22,7 @@ use rustc_hash::{FxHashMap, FxHasher};
 
 use input::{
     DAY, Dates, GAP, Mapped, WEEK, chunk_batches, csv_files, decimal, fields, lines, rows, timestamp,
-    timestamp_cached, will_need,
+    ingest_within_day, timestamp_cached, will_need,
 };
 use output::{CampaignRow, UserRow};
 
@@ -643,11 +643,13 @@ fn route_rows<'a, const L: u32>(
                 }
                 _ => return None,
             };
+            let raw_ts = ts;
             let ts = timestamp_cached(ts, &mut dates)?;
             if ts < start || ts >= end {
                 return None;
             }
-            if timestamp_cached(ingest, &mut dates)? - ts > DAY {
+            // A malformed ingest time fails validation just like one more than a day late.
+            if !ingest_within_day(ingest, raw_ts, ts, &mut dates) {
                 return None;
             }
             Some((ts, price, category))

@@ -344,6 +344,33 @@ pub fn timestamp_cached(raw: &[u8], dates: &mut Dates) -> Option<i64> {
     timestamp(raw)
 }
 
+/// True when `ingest` is a valid timestamp at most a day after `ts_ms`, which `ts_raw` parsed to.
+/// Two `Z` timestamps in the same hour (the usual case) need only the minutes and seconds of
+/// `ingest` checked, which one 8-byte load does; everything else takes the full parse.
+#[inline]
+pub fn ingest_within_day(ingest: &[u8], ts_raw: &[u8], ts_ms: i64, dates: &mut Dates) -> bool {
+    if let (Ok(ingest), Ok(ts_raw)) = (<&[u8; 20]>::try_from(ingest), <&[u8; 20]>::try_from(ts_raw))
+        && ingest[..13] == ts_raw[..13]
+    {
+        // `ts_raw` parsed with 20 bytes, so it is `YYYY-MM-DDTHH:MM:SSZ`. Bytes 12..20 of
+        // `ingest` are the hour's last digit, `:MM:SS` and the zone.
+        let x = u64::from_le_bytes(ingest[12..20].try_into().unwrap());
+        let digits = 0x00FF_FF00_FFFF_0000u64;
+        let y = (x ^ 0x3030_3030_3030_3030) & digits;
+        let (minute, second) = (((y >> 16) & 0xFF) * 10 + ((y >> 24) & 0xFF), ((y >> 40) & 0xFF) * 10 + ((y >> 48) & 0xFF));
+        if (x >> 8) & 0xFF == u64::from(b':')
+            && (x >> 32) & 0xFF == u64::from(b':')
+            && x >> 56 == u64::from(b'Z')
+            && ((y + 0x7676_7676_7676_7676) | y) & 0x8080_8080_8080_8080 == 0
+            && minute < 60
+            && second < 60
+        {
+            return true;
+        }
+    }
+    timestamp_cached(ingest, dates).is_some_and(|ingest| ingest - ts_ms <= DAY)
+}
+
 #[inline]
 fn time_of_day(rest: &[u8], day: i64) -> Option<i64> {
     let [i, j, b':', k, l, b':', m, n, zone @ ..] = rest else {
@@ -741,5 +768,37 @@ mod tests {
             check::<7>(text.as_bytes());
             check::<7>(&text.as_bytes()[..text.len() - 1]);
         }
+    }
+
+    #[test]
+    fn ingest_within_day_matches_the_full_parse() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let alphabet = *b"0123456789:Z-T+ 9";
+        let mut dates = Dates::new();
+        let mut fast_hits = 0;
+        for _ in 0..400_000 {
+            let mut ts = *b"2026-10-03T12:34:56Z";
+            let mut ingest = ts;
+            // Mostly small digit changes, sometimes arbitrary bytes in arbitrary places.
+            for _ in 0..next() % 4 {
+                let at = (next() % 20) as usize;
+                ingest[at] = if next() % 3 == 0 { alphabet[(next() % 17) as usize] } else { b'0' + (next() % 10) as u8 };
+            }
+            if next() % 5 == 0 {
+                ts[(next() % 20) as usize] = b'0' + (next() % 10) as u8;
+            }
+            let Some(ts_ms) = timestamp_cached(&ts, &mut dates) else { continue };
+            let ingest: &[u8] = if next() % 16 == 0 { &ingest[..19] } else { &ingest };
+            let expected = timestamp_cached(ingest, &mut dates).is_some_and(|i| i - ts_ms <= DAY);
+            assert_eq!(ingest_within_day(ingest, &ts, ts_ms, &mut dates), expected, "{ts:?} {ingest:?}");
+            fast_hits += usize::from(expected);
+        }
+        assert!(fast_hits > 10_000);
     }
 }
