@@ -480,16 +480,53 @@ struct Line {
     offset: u32,
 }
 
-/// Field `index` of an event line, cleaned of its quotes. Scans only up to that field.
+/// Marks (0x80) every byte of `word` that is a comma, and no other.
+#[inline(always)]
+fn comma_bytes(word: u64) -> u64 {
+    let t = word ^ 0x2C2C_2C2C_2C2C_2C2C;
+    !(((t & 0x7F7F_7F7F_7F7F_7F7F) + 0x7F7F_7F7F_7F7F_7F7F) | t | 0x7F7F_7F7F_7F7F_7F7F)
+}
+
+/// Field `index` of an event line, cleaned of its quotes. Scans only up to that field, eight bytes at
+/// a time: a `memchr` call per comma costs more than the short fields it skips.
 fn cold_field<'a>(chunks: &[Text<'a>], line: Line, index: usize) -> Text<'a> {
     let chunk = chunks[line.chunk as usize];
-    let mut start = line.offset as usize;
-    for _ in 0..index {
-        // The line was accepted by `rows`, so it has all seven fields: these commas exist.
-        start += memchr::memchr(b',', &chunk[start..]).expect("line was already parsed") + 1;
+    let rest = &chunk[line.offset as usize..];
+    let (mut seen, mut start, mut end) = (0usize, 0usize, None);
+    let mut pos = 0;
+    'scan: while pos + 8 <= rest.len() {
+        let mut mask = comma_bytes(u64::from_le_bytes(rest[pos..pos + 8].try_into().unwrap()));
+        while mask != 0 {
+            let at = pos + (mask.trailing_zeros() / 8) as usize;
+            mask &= mask - 1;
+            seen += 1;
+            if seen == index {
+                start = at + 1;
+            }
+            if seen == index + 1 {
+                end = Some(at);
+                break 'scan;
+            }
+        }
+        pos += 8;
     }
-    let end = start + memchr::memchr(b',', &chunk[start..]).expect("line was already parsed");
-    match &chunk[start..end] {
+    if end.is_none() {
+        for (at, &byte) in rest.iter().enumerate().skip(pos) {
+            if byte == b',' {
+                seen += 1;
+                if seen == index {
+                    start = at + 1;
+                }
+                if seen == index + 1 {
+                    end = Some(at);
+                    break;
+                }
+            }
+        }
+    }
+    // The line was accepted by `rows`, so it has all seven fields: these commas exist.
+    let end = end.expect("line was already parsed");
+    match &rest[start..end] {
         [b'"', inner @ .., b'"'] => inner,
         value => value,
     }
@@ -1407,6 +1444,44 @@ mod tests {
             assert_eq!(cold_field(&chunks, line, 0), fields[0]);
             assert_eq!(cold_field(&chunks, line, 1), fields[1]);
             assert_eq!(cold_field(&chunks, line, 3), fields[3]);
+        }
+    }
+
+    #[test]
+    fn cold_field_matches_a_memchr_scan() {
+        fn slow<'a>(chunk: &'a [u8], offset: usize, index: usize) -> &'a [u8] {
+            let mut start = offset;
+            for _ in 0..index {
+                start += memchr::memchr(b',', &chunk[start..]).unwrap() + 1;
+            }
+            let end = start + memchr::memchr(b',', &chunk[start..]).unwrap();
+            match &chunk[start..end] {
+                [b'"', inner @ .., b'"'] => inner,
+                value => value,
+            }
+        }
+        let mut state = 0x1234_5678_9abc_def1u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let alphabet = *b",,,,\"ab0 \xAC\x2C\x00\xFF\x80";
+        for _ in 0..20_000 {
+            // Junk before the line, the line itself (any bytes, any number of commas), and seven
+            // commas after it so every field asked for ends somewhere.
+            let mut text: Vec<u8> = (0..next() % 90).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect();
+            let offset = text.len();
+            text.extend((0..next() % 90).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]));
+            text.extend_from_slice(&[b','; 7]);
+            let chunks = [text.as_slice()];
+            for index in 0..6 {
+                assert_eq!(
+                    cold_field(&chunks, Line { chunk: 0, offset: offset as u32 }, index),
+                    slow(&text, offset, index)
+                );
+            }
         }
     }
 
