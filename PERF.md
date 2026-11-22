@@ -284,3 +284,79 @@ gh workflow run x86-bench.yml --ref exp/compact-ids -f only_micro=true   # micro
 SS_SHARDS=512 SS_TIMING=1 target/release/shopping-sessions DATA OUT        # knob and stage timers
 SS_BENCH=1 target/release/shopping-sessions DATA OUT                       # parse microbenchmark
 ```
+
+## Phase 6: rewrite prototypes (engine v2, v3) and huge pages
+
+Branch `exp/rewrite-v2` (from `exp/compact-ids` = adaptive shards). `main` and `scored-1.99s` stay at
+`0141e3d`. All three engines live in one binary, selected by `SS_ENGINE=v1|v2|v3` (default v1, the
+generic engine), so every comparison is the same build on the same runner and data.
+
+- **v2** (`src/v2.rs`): fused parse+pack writes a 40 B row to a lane-local sequential array and a 24 B
+  dedup record to a radix partition; an open-addressing table per partition marks losers in a
+  1 B/row flag array (no winner list, no second table); a lane pass skips losers, resolves the person
+  and routes. Ingest is compared as a number from a canonical 20-byte field; anything else sends the
+  whole run to the generic engine.
+- **v3**: links are built first, so the parse pass resolves the person inline and writes the final
+  routed 40 B record once. The dedup record holds only (hash, line, slot); a loser is tombstoned in
+  place (`category = INVALID`), found with a byte-wise ingest comparison (no canonical-form
+  assumption, no fallback). No resolve+route pass.
+- **THP** (`src/thp.rs`, `SS_THP=1`, Linux only): allocations of 8 MiB or more are mapped directly,
+  2 MiB-aligned, with `MADV_HUGEPAGE`. Everything else uses the system allocator.
+
+Correctness (x86 CI, run 44978377251): v2, v3, v1+THP and v3+THP each pass the 7 adversarial fixtures and
+the Python oracle on seeds 11/22/33/44 at NCPU 1, 3 and 8; v2/v3/THP output equals the generic
+engine on 10M-event seeds 7 and 99 and equals the scored build on the 20M dataset. Locally (M5): all
+36 fixtures, 7 adversarial, the 1M official answer, d5m/d20m vs baseline, 5 oracle seeds, for v1 and v3.
+
+### Interleaved A/B, EPYC 9V45, 4 vCPU, 13 rounds, 20M events (wall median, ms; CPU ms)
+
+| Build | Wall | vs scored | CPU |
+| --- | ---: | ---: | ---: |
+| scored `0141e3d` | 2698 | | 9801 |
+| v1 (adaptive shards) | 2661 | -1.5% | 9635 |
+| v2 | 2665 | -1.2% | 9409 |
+| v3 | 2737 | +1.4% | 9489 |
+| **v1 + THP** | **2381** | **-11.8%** | 8760 |
+| v3 + THP | 2382 | -11.7% | 8621 |
+
+Extra seeds, 10M events, 9 rounds, wall vs v1: seed 7: THP -78 ms (-6.1%), v2 +39, v3 +37; seed 99:
+THP -84 ms (-7.2%), v2 +109, v3 +77. An earlier run on an EPYC 7763 had v2 +56 ms at 20M and
++127/+172 ms on the 10M seeds, so the result does not depend on the CPU.
+
+### Why v2 and v3 were rejected
+
+- v2's dedup is genuinely cheaper (668 vs 874 thread-ms on the 9V45; 823 vs 983 on the 7763), but the
+  lane-local row array is a new 40 B/row allocation: minor page faults went 616k -> 902k and the
+  parse pass got slower by about the amount dedup saved. Resolve+route is unchanged (1351 vs 1456
+  thread-ms) because it still reads every row once.
+- v3 removes that pass, but moves person resolution (link lookup, user hashes) in front of dedup, so
+  it runs for the 2 to 4% duplicate rows too and writes 40 B per event in the parse pass. The parse
+  pass grew more than the removed stage shrank.
+- Neither changes the unavoidable work: parse (113 ns/row), group, sort, sessionize, Parquet.
+  Moving records between stages differently only moves cost between stages.
+- Hardware counters (cycles, cache misses) are not exposed on these runners (`<not supported>`), so
+  cycles/row and miss rates could not be measured; task-clock and page faults are what is reported.
+  Task-clock: v1 9969 ms, v2 9818, v3 9895 (20M, 4 vCPU), i.e. 498, 491, 495 ns/row of CPU.
+
+### The one real lever: kernel memory cost
+
+Peak RSS is about 3.9 GB for 20M events; page faulting and zeroing was already about 6% of samples
+in Phase 5 and the first-touch cost is spread across every stage. 2 MiB pages cut CPU by 9 to 10%
+and wall by 6 to 12%, on both engines, on every dataset. That is larger than anything the data-layout
+rewrites bought, and it needs no change to semantics. It is opt-in (`SS_THP=1`); a Linux host with
+THP set to `never` gets nothing from `madvise` and loses nothing.
+
+### Is full integration justified?
+
+No. At 2381 ms on a 4-vCPU shared runner against a 2698 ms scored-build baseline on the same runner,
+the best verified build is 1.13x faster. The target is 7.65x. Nothing measured here is on a path to
+it: the remaining cost is spread over parse, group/sort and Parquet, each of which would need to be
+several times cheaper at once, and the three layouts tried so far trade cost between stages without
+removing it.
+
+### Reproduce
+
+```sh
+gh workflow run x86-bench.yml --ref exp/rewrite-v2 -f base=0141e3d -f only_micro=engine
+SS_ENGINE=v3 SS_THP=1 SS_TIMING=1 target/release/shopping-sessions DATA OUT
+```
