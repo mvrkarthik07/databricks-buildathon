@@ -1,6 +1,11 @@
 mod input;
 mod output;
 mod v2;
+#[cfg(target_os = "linux")]
+mod thp;
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static ALLOC: thp::Alloc = thp::Alloc;
 
 use std::cmp::{Reverse, min};
 use std::env;
@@ -859,8 +864,15 @@ fn aggregate<'a>(
     let mut people = People::default();
     let event_count: usize = event_batches.iter().map(Vec::len).sum();
     let mut event_person = Vec::with_capacity(event_count);
+    // Engine v3 tombstones duplicate losers in place (`category == INVALID`); skip them here.
+    let mut alive = 0;
     for event in event_batches.iter().flatten() {
-        event_person.push(people.intern(event.hash, event.hash2, || event.name.text(chunks, links)));
+        if event.event.category == INVALID {
+            event_person.push(u32::MAX);
+        } else {
+            alive += 1;
+            event_person.push(people.intern(event.hash, event.hash2, || event.name.text(chunks, links)));
+        }
     }
     let mut click_person = Vec::with_capacity(click_batches.iter().map(Vec::len).sum());
     for click in click_batches.iter().flatten() {
@@ -873,8 +885,9 @@ fn aggregate<'a>(
             .iter()
             .flatten()
             .zip(&event_person)
+            .filter(|&(_, &person)| person != u32::MAX)
             .map(|(event, &person)| (person, event.event)),
-        event_count,
+        alive,
         person_count,
     );
     let click_count = click_person.iter().flatten().count();
@@ -1090,7 +1103,21 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
     lap("link parse");
     // `SS_ENGINE=v2` selects the packed-row engine (src/v2.rs); the generic engine below is also
     // its fallback for input the fast path does not cover.
-    let use_v2 = env::var("SS_ENGINE").is_ok_and(|e| e == "v2");
+    let engine = env::var("SS_ENGINE").unwrap_or_default();
+    let use_v2 = engine == "v2";
+    let use_v3 = engine == "v3";
+    let (people, events) = if use_v3 {
+        let people = build_links(link_rows);
+        lap("build_links");
+        let shards = dedup_shards();
+        let mut lanes = parallel(event_batches.into_iter().enumerate().collect(), workers, |(i, chunks)| {
+            v2::parse_route(i as u32, chunks, &catalog, (start, end), shards, &people, workers)
+        });
+        lap("v3 parse+route");
+        v2::dedup_all3(&mut lanes, &event_chunks, workers);
+        lap("v3 dedup");
+        (people, lanes.into_iter().map(|lane| lane.routed).collect::<Vec<_>>())
+    } else {
     let backup = use_v2.then(|| event_batches.clone());
     let irregular = std::sync::atomic::AtomicBool::new(false);
     let shards = dedup_shards();
@@ -1134,6 +1161,8 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
         (None, None) => unreachable!(),
     };
     lap("dedup");
+        (people, events)
+    };
     let clicks = parallel(chunk_batches(&click_files, workers), workers, |chunks| {
         route_clicks(chunks, &people, &catalog, start, end, workers)
     });
@@ -1195,6 +1224,10 @@ fn run(data: &Path, out: &Path, workers: usize) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if env::var_os("SS_THP").is_some() {
+        thp::ON.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let mut args = env::args_os().skip(1);
     let mut path =
         |key, default| PathBuf::from(args.next().or_else(|| env::var_os(key)).unwrap_or(default));

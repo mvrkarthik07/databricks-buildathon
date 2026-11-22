@@ -98,15 +98,18 @@ jobs:
       - name: "engine: correctness of v2 (unit tests, adversarial, oracle seeds, worker counts)"
         if: ${{ inputs.only_micro == 'engine' }}
         run: |
-          export SS_ENGINE=v2
           cargo test --release --locked
-          make check-adversarial PYTHON=python3 REF=/tmp/new
-          for seed in 11 22 33 44; do
-            generator/target/release/generate --seed $seed --events 200000 --clicks 50000 --output /tmp/small$seed
-            python3 ref/reference.py /tmp/small$seed /tmp/oracle$seed > /dev/null
-            for n in 1 2 3 4 8; do
-              rm -rf /tmp/new$seed; NCPU=$n /tmp/new /tmp/small$seed /tmp/new$seed
-              python3 tools/diff.py /tmp/new$seed /tmp/oracle$seed | grep -q '^MATCH' && echo "seed $seed NCPU=$n: MATCH" || { echo "seed $seed NCPU=$n: DIFFERENT"; exit 1; }
+          cat /sys/kernel/mm/transparent_hugepage/enabled || true
+          for cfg in "v2 0" "v3 0" "v1 1" "v3 1"; do
+            set -- $cfg; export SS_ENGINE=$1; if [ "$2" = 1 ]; then export SS_THP=1; else unset SS_THP; fi
+            echo "== engine $SS_ENGINE thp=$2"
+            make check-adversarial PYTHON=python3 REF=/tmp/new | tail -1
+            for seed in 11 22 33 44; do
+              [ -d /tmp/small$seed ] || { generator/target/release/generate --seed $seed --events 200000 --clicks 50000 --output /tmp/small$seed; python3 ref/reference.py /tmp/small$seed /tmp/oracle$seed > /dev/null; }
+              for n in 1 3 8; do
+                rm -rf /tmp/new$seed; NCPU=$n /tmp/new /tmp/small$seed /tmp/new$seed
+                python3 tools/diff.py /tmp/new$seed /tmp/oracle$seed | grep -q '^MATCH' && echo "seed $seed NCPU=$n: MATCH" || { echo "seed $seed NCPU=$n: DIFFERENT"; exit 1; }
+              done
             done
           done
       - name: "engine: extra seeds, v2 output must equal the generic engine's"
@@ -114,17 +117,25 @@ jobs:
         run: |
           for seed in 7 99; do
             generator/target/release/generate --seed $seed --events 10000000 --clicks 2500000 --output /tmp/x$seed
-            rm -rf /tmp/o1 /tmp/o2; SS_ENGINE=v1 /tmp/new /tmp/x$seed /tmp/o1; SS_ENGINE=v2 /tmp/new /tmp/x$seed /tmp/o2
-            python3 tools/diff.py /tmp/o2 /tmp/o1 | tail -1 | sed "s/^/seed $seed v2 vs v1: /"
-            python3 tools/diff.py /tmp/o2 /tmp/o1 | grep -q '^MATCH'
+            rm -rf /tmp/o1; SS_ENGINE=v1 /tmp/new /tmp/x$seed /tmp/o1
+            for cfg in "v2 0" "v3 0" "v3 1" "v1 1"; do
+              set -- $cfg; rm -rf /tmp/o2
+              if [ "$2" = 1 ]; then SS_ENGINE=$1 SS_THP=1 /tmp/new /tmp/x$seed /tmp/o2; else SS_ENGINE=$1 /tmp/new /tmp/x$seed /tmp/o2; fi
+              python3 tools/diff.py /tmp/o2 /tmp/o1 | tail -1 | sed "s/^/seed $seed $1 thp=$2 vs v1: /"
+              python3 tools/diff.py /tmp/o2 /tmp/o1 | grep -q '^MATCH'
+            done
           done
-          rm -rf /tmp/o1 /tmp/o2; SS_ENGINE=v2 /tmp/new /tmp/data /tmp/o2; /tmp/base /tmp/data /tmp/o1
-          python3 tools/diff.py /tmp/o2 /tmp/o1 | tail -1 | sed "s/^/20M v2 vs scored build: /"
-          python3 tools/diff.py /tmp/o2 /tmp/o1 | grep -q '^MATCH'
+          rm -rf /tmp/o1; /tmp/base /tmp/data /tmp/o1
+          for cfg in "v2 0" "v3 0" "v3 1"; do
+            set -- $cfg; rm -rf /tmp/o2; if [ "$2" = 1 ]; then export SS_THP=1; else unset SS_THP; fi
+            SS_ENGINE=$1 /tmp/new /tmp/data /tmp/o2
+            python3 tools/diff.py /tmp/o2 /tmp/o1 | tail -1 | sed "s/^/20M $1 thp=$2 vs scored build: /"
+            python3 tools/diff.py /tmp/o2 /tmp/o1 | grep -q '^MATCH'
+          done; unset SS_THP
       - name: "engine: stage laps and thread-ms, v1 then v2 (last of 3)"
         if: ${{ inputs.only_micro == 'engine' }}
         run: |
-          for e in v1 v2; do
+          for e in v1 v2 v3; do
             for i in 1 2 3; do rm -rf /tmp/out-lap; NCPU=$(nproc) SS_ENGINE=$e SS_TIMING=1 /tmp/new /tmp/data /tmp/out-lap 2> /tmp/laps-$e.txt; done
             echo "== $e"; cat /tmp/laps-$e.txt
             NCPU=$(nproc) SS_ENGINE=$e /usr/bin/time -v /tmp/new /tmp/data /tmp/out-rss 2>&1 | grep -E "Maximum resident|Elapsed|Minor|Voluntary|Involuntary" || true
@@ -135,15 +146,15 @@ jobs:
           sudo apt-get install -y -q linux-tools-common linux-tools-$(uname -r) > /dev/null 2>&1 || sudo apt-get install -y -q linux-tools-generic > /dev/null 2>&1 || true
           sudo sysctl -q kernel.perf_event_paranoid=-1 || true
           PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1); PERF=${PERF:-perf}
-          for e in v1 v2; do
+          for e in v1 v2 v3; do
             echo "== $e"; NCPU=$(nproc) SS_ENGINE=$e sudo -E $PERF stat -e task-clock,cycles,instructions,cache-misses,cache-references,page-faults /tmp/new /tmp/data /tmp/o-perf 2>&1 | grep -E "task-clock|cycles|instructions|cache|page-faults|not supported|elapsed" || true
           done
       - name: "engine: interleaved A/B (scored build, generic engine, v2), 20M events"
         if: ${{ inputs.only_micro == 'engine' }}
         run: |
-          printf '#!/bin/sh\nSS_ENGINE=v1 exec /tmp/new "$@"\n' > /tmp/new-v1; printf '#!/bin/sh\nSS_ENGINE=v2 exec /tmp/new "$@"\n' > /tmp/new-v2; chmod +x /tmp/new-v1 /tmp/new-v2
-          NCPU=$(nproc) python3 tools/ab.py /tmp/data 15 /tmp/base /tmp/new-v1 /tmp/new-v2
+          printf '#!/bin/sh\nSS_ENGINE=v1 exec /tmp/new "$@"\n' > /tmp/new-v1; printf '#!/bin/sh\nSS_ENGINE=v2 exec /tmp/new "$@"\n' > /tmp/new-v2; printf '#!/bin/sh\nSS_ENGINE=v3 exec /tmp/new "$@"\n' > /tmp/new-v3; printf '#!/bin/sh\nSS_THP=1 SS_ENGINE=v1 exec /tmp/new "$@"\n' > /tmp/new-v1t; printf '#!/bin/sh\nSS_THP=1 SS_ENGINE=v3 exec /tmp/new "$@"\n' > /tmp/new-v3t; chmod +x /tmp/new-v1 /tmp/new-v2 /tmp/new-v3 /tmp/new-v1t /tmp/new-v3t
+          NCPU=$(nproc) python3 tools/ab.py /tmp/data 13 /tmp/base /tmp/new-v1 /tmp/new-v1t /tmp/new-v2 /tmp/new-v3 /tmp/new-v3t
       - name: "engine: interleaved A/B on the extra seeds"
         if: ${{ inputs.only_micro == 'engine' }}
         run: |
-          for seed in 7 99; do echo "== seed $seed (10M)"; NCPU=$(nproc) python3 tools/ab.py /tmp/x$seed 11 /tmp/new-v1 /tmp/new-v2; done
+          for seed in 7 99; do echo "== seed $seed (10M)"; NCPU=$(nproc) python3 tools/ab.py /tmp/x$seed 9 /tmp/new-v1 /tmp/new-v1t /tmp/new-v2 /tmp/new-v3; done

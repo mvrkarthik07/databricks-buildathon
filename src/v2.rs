@@ -234,3 +234,178 @@ pub fn resolve_route<'a>(
     stage(2, t);
     routed
 }
+
+// ---------------------------------------------------------------------------------------------
+// Engine v3: every event is written once, as its final person-routed record.
+//
+// Links are built first, so the parse pass resolves each valid row's person inline and appends the
+// routed `NamedEvent` to its lane's partition for that person's worker. The dedup record carries
+// only `(event hash, line, slot, q)`: where the row's routed record lives. A duplicate is settled
+// by reading the two cold ingest fields (the generic comparison, byte-wise) and tombstoning the
+// loser's routed record in place (`category = INVALID`). Nothing else is written per event, and
+// the generic fallback is not needed because ingest is compared as bytes.
+// ---------------------------------------------------------------------------------------------
+
+const NONE: u32 = u32::MAX;
+
+#[derive(Clone, Copy)]
+struct D3 {
+    hash: u64,
+    line: Line,
+    /// `lane * workers + worker` of the routed record, or `NONE` for an invalid copy (it takes
+    /// part in dedup but has no record to kill).
+    slot: u32,
+    q: u32,
+}
+
+pub struct Lane3 {
+    pub routed: Vec<Vec<NamedEvent>>,
+    shards: Vec<Vec<D3>>,
+}
+
+pub fn parse_route<'a>(
+    lane_index: u32,
+    chunks: Vec<(u32, Text<'a>)>,
+    catalog: &Catalog<'a>,
+    (start, end): (i64, i64),
+    shard_count: usize,
+    links: &Links<'a>,
+    workers: usize,
+) -> Lane3 {
+    let lines: usize = chunks.iter().map(|(_, chunk)| memchr::memchr_iter(b'\n', chunk).count()).sum();
+    let share = lines / shard_count + lines / shard_count / 16 + 64;
+    let mut shards: Vec<Vec<D3>> = (0..shard_count).map(|_| Vec::with_capacity(share)).collect();
+    let per_worker = lines / workers + lines / workers / 8 + 16;
+    let mut routed: Vec<Vec<NamedEvent>> = (0..workers).map(|_| Vec::with_capacity(per_worker)).collect();
+    let mut dates = Dates::new();
+    for (_, chunk) in chunks.iter().take(2) {
+        will_need(chunk);
+    }
+    for (index, &(chunk_index, chunk)) in chunks.iter().enumerate() {
+        if let Some((_, ahead)) = chunks.get(index + 2) {
+            will_need(ahead);
+        }
+        rows::<7>(chunk, |[id, user, ts, ingest, kind, product, price]| {
+            if id.is_empty() || ingest.len() != 20 {
+                return;
+            }
+            let at = id.as_ptr().addr() - chunk.as_ptr().addr();
+            let offset = at - usize::from(at > 0 && chunk[at - 1] == b'"');
+            let line = Line { chunk: chunk_index, offset: offset as u32 };
+            let event_hash = hash(id);
+            let shard = ((event_hash >> 40) as usize) % shard_count;
+            let parsed = (|| {
+                if user.is_empty() || product.is_empty() {
+                    return None;
+                }
+                let (price, category) = match kind {
+                    b"view" | b"cart" => (0, 0),
+                    b"purchase" => {
+                        let price = decimal(price, 10_000_000).filter(|&n| n != 0)?;
+                        let category = catalog
+                            .products
+                            .ids
+                            .get(product)
+                            .map_or(catalog.unknown, |&id| catalog.product_category[id as usize]);
+                        (price as u32, category)
+                    }
+                    _ => return None,
+                };
+                let ts = timestamp_cached(ts, &mut dates)?;
+                if ts < start || ts >= end {
+                    return None;
+                }
+                if timestamp_cached(ingest, &mut dates)? - ts > DAY {
+                    return None;
+                }
+                Some((ts, price, category))
+            })();
+            let Some((ts, price, category)) = parsed else {
+                shards[shard].push(D3 { hash: event_hash, line, slot: NONE, q: 0 });
+                return;
+            };
+            let (user_hash, user_hash2) = (hash(user), hash2(user));
+            let (name, hash, hash2) = match links.resolve(user_hash, user_hash2) {
+                Some(slot) => (NameRef::linked(slot.person), slot.target.0, slot.target.1),
+                None => (NameRef::line(line), user_hash, user_hash2),
+            };
+            let worker = worker_of(hash, workers);
+            let q = routed[worker].len() as u32;
+            routed[worker].push(NamedEvent { name, hash, hash2, event: Event { ts, price, category } });
+            shards[shard].push(D3 { hash: event_hash, line, slot: lane_index * workers as u32 + worker as u32, q });
+        });
+    }
+    Lane3 { routed, shards }
+}
+
+struct Base(*mut NamedEvent);
+// SAFETY: each routed record is written by at most one dedup worker (a row sits in exactly one
+// shard), through an atomic, and the vectors are not otherwise touched during that phase.
+unsafe impl Sync for Base {}
+
+fn dedup_shard3(shard: usize, lanes: &[Lane3], bases: &[Base], chunks: &[Text<'_>]) {
+    let n: usize = lanes.iter().map(|lane| lane.shards[shard].len()).sum();
+    let mut recs: Vec<D3> = Vec::with_capacity(n);
+    for lane in lanes {
+        recs.extend_from_slice(&lane.shards[shard]);
+    }
+    let capacity = (n * 2).next_power_of_two().max(16);
+    let mask = capacity - 1;
+    let mut table = vec![0u32; capacity];
+    let kill = |r: &D3| {
+        if r.slot != NONE {
+            // SAFETY: `slot` and `q` address a record this phase owns exclusively (see `Base`).
+            unsafe {
+                let event = bases[r.slot as usize].0.add(r.q as usize);
+                std::sync::atomic::AtomicU32::from_ptr(&raw mut (*event).event.category).store(INVALID, Relaxed);
+            }
+        }
+    };
+    for i in 0..n {
+        let r = recs[i];
+        let mut pos = r.hash as usize & mask;
+        loop {
+            let t = table[pos];
+            if t == 0 {
+                table[pos] = i as u32 + 1;
+                break;
+            }
+            let o = recs[(t - 1) as usize];
+            if o.hash == r.hash && cold_field(chunks, o.line, 0) == cold_field(chunks, r.line, 0) {
+                if cold_field(chunks, r.line, 3) < cold_field(chunks, o.line, 3) {
+                    table[pos] = i as u32 + 1;
+                    kill(&o);
+                } else {
+                    kill(&r);
+                }
+                break;
+            }
+            pos = (pos + 1) & mask;
+        }
+    }
+}
+
+pub fn dedup_all3(lanes: &mut [Lane3], chunks: &[Text<'_>], workers: usize) {
+    let bases: Vec<Base> = lanes
+        .iter_mut()
+        .flat_map(|lane| lane.routed.iter_mut().map(|v| Base(v.as_mut_ptr())))
+        .collect();
+    let lanes: &[Lane3] = lanes;
+    let shard_count = lanes.first().map_or(0, |lane| lane.shards.len());
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                let t = std::time::Instant::now();
+                loop {
+                    let shard = next.fetch_add(1, Relaxed);
+                    if shard >= shard_count {
+                        break;
+                    }
+                    dedup_shard3(shard, lanes, &bases, chunks);
+                }
+                stage(0, t);
+            });
+        }
+    });
+}
