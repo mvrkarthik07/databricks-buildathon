@@ -872,7 +872,11 @@ fn route_clicks<'a>(
 ) -> Vec<Vec<NamedClick<'a>>> {
     let t0 = prof::now();
     let sys0 = prof::thread_sys();
-    let mut routed: Vec<Vec<NamedClick>> = (0..buckets.count()).map(|_| Vec::new()).collect();
+    // Counting the lines first is cheap next to parsing them, and sizes every bucket once so none
+    // has to grow (and be copied) as clicks arrive.
+    let lines: usize = chunks.iter().map(|chunk| memchr::memchr_iter(b'\n', chunk).count()).sum();
+    let capacity = lines / buckets.count() + lines / buckets.count() / 8 + 16;
+    let mut routed: Vec<Vec<NamedClick>> = (0..buckets.count()).map(|_| Vec::with_capacity(capacity)).collect();
     let mut dates = Dates::new();
     let mut pending: Vec<PendingClick> = Vec::with_capacity(BATCH);
     let route_pending = |pending: &mut Vec<PendingClick<'a>>, routed: &mut Vec<Vec<NamedClick<'a>>>| {
