@@ -98,6 +98,14 @@ struct People {
 }
 
 impl People {
+    fn with_capacity(people: usize) -> Self {
+        Self {
+            table: HashTable::with_capacity(people),
+            keys: Vec::with_capacity(people),
+            names: Vec::with_capacity(people),
+        }
+    }
+
     #[inline]
     fn find(&self, hash: u64, hash2: u64) -> Option<u32> {
         self.table
@@ -1180,8 +1188,10 @@ fn aggregate_part<'a>(
     acc: &mut Accum<'a>,
 ) {
     let mut t = prof::now();
-    let mut people = People::default();
     let event_count: usize = event_batches.iter().map(Vec::len).sum();
+    // A person has about 30 events on average; sizing for a bit more than that avoids regrowing
+    // (and rehashing) the table as people arrive.
+    let mut people = People::with_capacity(event_count / 16 + 16);
     let mut event_person = Vec::with_capacity(event_count);
     for event in event_batches.iter().flatten() {
         event_person.push(people.intern(event.hash, event.hash2, event.name));
